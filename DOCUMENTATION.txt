@@ -1,0 +1,464 @@
+================================================================================
+  CNN-ViT HYBRID MULTIMODAL DEFECT DETECTION SYSTEM
+  Technical Documentation (Reference Draft)
+  Date: 2026-04-27
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+  1. Project Overview
+  2. System Architecture
+  3. Dataset & Annotations
+  4. Data Loading & Augmentation
+  5. Models
+     5.1 Single-Modal Model (MobileViTSegmentationModel)
+     5.2 Late Fusion Model (LateFusionSegmentationModel)
+     5.3 Modality Attention Gate
+  6. Training Pipeline
+     6.1 Loss Function
+     6.2 Optimizer & Scheduler
+     6.3 Gradient Clipping
+     6.4 Checkpointing
+     6.5 Early Stopping
+  7. Evaluation Metrics
+  8. Configuration Reference (config.yaml)
+  9. File / Module Reference
+ 10. Notable Design Decisions
+
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+This system performs semantic segmentation for infrastructure defect detection
+on bridge imagery captured via UAV. It targets four defect categories:
+
+  Class 0 – Background      (non-defect pixels)
+  Class 1 – Crack           (linear surface damage)
+  Class 2 – Spall           (surface layer detachment)
+  Class 3 – Delamination    (reserved; no annotations yet)
+  Class 4 – Moisture        (water ingress / staining)
+
+Two training configurations are supported:
+  - Single-Modal: uses one fused RGB image per sample.
+  - Late Fusion (primary): uses separate RGB and IRT (infrared thermal) images
+    per sample, fused at the decoder stage via learned modality attention.
+
+The system is built on PyTorch and uses a MobileViT-S backbone (hybrid CNN-ViT)
+from the `timm` library.
+
+
+================================================================================
+2. SYSTEM ARCHITECTURE
+================================================================================
+
+HIGH-LEVEL FLOW (Late Fusion)
+------------------------------
+
+  RGB Image [B, 3, H, W] ──→ RGB Backbone (MobileViT-S) ──→ RGB Features
+                                                                          \
+                                                               Modality    → Fused → Decoder → Segmentation
+                                                               Attention  /           Map
+  IRT Image [B, 1, H, W] ──→ IRT Backbone (MobileViT-S*) ──→ IRT Features
+                                                                          /
+
+  * IRT backbone first Conv2d adapted: 3-channel → 1-channel input
+    (pretrained RGB filters are summed across channels to preserve energy)
+
+DECODER STAGES
+--------------
+The decoder progressively upsamples the fused feature map by 2× at each of
+5 stages until the original image resolution is restored (stride 32 total).
+
+  - Stages 1 & 2: Modality attention applied (lowest resolution; cross-modal
+    context is most valuable at coarse scales)
+  - Stages 3–5: Single fused pathway (higher resolution, efficiency priority)
+
+SINGLE-MODAL FLOW (MobileViTSegmentationModel)
+-----------------------------------------------
+
+  Image [B, 3, H, W] ──→ MobileViT-S Backbone ──→ Features [B, 640, H/32, W/32]
+                                                              │
+                                            5-Stage Decoder (2× upsample each)
+                                                              │
+                                          Segmentation Map [B, num_classes, H, W]
+
+
+================================================================================
+3. DATASET & ANNOTATIONS
+================================================================================
+
+SOURCE ANNOTATIONS
+------------------
+Raw annotations are stored in CVAT 1.1 XML format (annotations.xml).
+The class CVATXMLToCOCOConverter (dataset_utils.py) converts these into
+COCO-format JSON files at runtime if they are missing or empty.
+
+  - Cracks   → rendered as thick polylines (line width = 10 px), because
+               cracks are linear features, not filled regions.
+  - Spalls   → rendered as filled polygons.
+  - Moisture → rendered as filled polygons.
+  - Delamination → reserved; no annotations currently present.
+
+COCO JSON STRUCTURE
+-------------------
+After conversion, two JSON files are produced:
+  dataset/instances_train.json   (80% of images)
+  dataset/instances_val.json     (20% of images)
+
+SPLIT RATIO
+-----------
+train_ratio: 0.8  →  80% train, 20% validation (no separate test set yet)
+
+IMAGE DIRECTORIES
+-----------------
+  RGB_FITTED/   — RGB imagery (PNG, 000000.png … 000068.png)
+  IRT_FITTED/   — IRT thermal imagery (JPG, matching stems)
+  FUSED/        — Pre-fused single-modal images (for single-modal pipeline)
+
+CLASS IMBALANCE NOTE
+--------------------
+Defect pixels are rare relative to background. Class-weighted loss is used
+to compensate (see Section 6.1).
+
+
+================================================================================
+4. DATA LOADING & AUGMENTATION
+================================================================================
+
+4.1 COCOSegmentationDataset  (single-modal)
+-------------------------------------------
+File: dataset.py
+
+  - Loads from COCO JSON annotation files.
+  - Renders polygon/polyline masks per image on the fly.
+  - Returns: dict { "image": Tensor[3,H,W], "mask": Tensor[H,W], "image_id" }
+  - Normalization: ImageNet mean/std  (mean=[0.485,0.456,0.406],
+                                        std =[0.229,0.224,0.225])
+
+4.2 MultiModalDataset  (dual-modal)
+------------------------------------
+File: dataset.py
+
+  - Loads paired RGB and IRT images matched by file stem.
+  - Returns: dict { "rgb": Tensor[3,H,W], "irt": Tensor[1,H,W],
+                    "mask": Tensor[H,W], "image_id" }
+  - RGB Normalization: ImageNet mean/std.
+  - IRT Normalization: min-max scaling to [0, 1].
+
+4.3 Augmentation Pipeline  (albumentations)
+--------------------------------------------
+Geometric transforms (applied identically to image, IRT, and mask):
+  - HorizontalFlip           p = 0.5
+  - VerticalFlip             p = 0.5
+  - RandomRotate90           p = 0.5
+  - ShiftScaleRotate         shift=0.1, scale=0.1, rotate=±15°, p = 0.5
+
+Photometric transforms (image only):
+  - ColorJitter              (configurable)
+  - GaussianBlur             kernel 3–5 px, p = 0.3
+  - GaussNoise               variance 10–50, p = 0.3
+
+Synchronization: albumentations' `additional_targets` mechanism ensures
+geometric transforms are applied identically to all channels (RGB, IRT, mask),
+preventing label misalignment.
+
+
+================================================================================
+5. MODELS
+================================================================================
+
+5.1 MobileViTSegmentationModel  (single-modal)
+-----------------------------------------------
+File: CNNVIT.py
+
+  Backbone:  MobileViT-S  (from timm, pretrained on ImageNet)
+             Fallback: MobileNetV3-small if MobileViT-S is unavailable.
+             Output: feature map [B, 640, H/32, W/32]
+
+  Head:      MobileViTSegmentationHead
+             5-stage decoder; each stage:
+               Conv2d(in_ch → hidden_dim) → BN → ReLU → 2× bilinear upsample
+             Final: Conv2d(hidden_dim → num_classes), no activation
+                    (logits fed directly to CrossEntropyLoss)
+
+  hidden_dim: 256 (configurable)
+
+  Forward signature:
+    model(image: Tensor[B,3,H,W]) → logits: Tensor[B,num_classes,H,W]
+
+5.2 LateFusionSegmentationModel  (dual-modal)
+----------------------------------------------
+File: late_fusion_model.py
+
+  Backbone (RGB): MobileViT-S, 3-channel input, pretrained weights.
+  Backbone (IRT): MobileViT-S, 1-channel input.
+                  Adaptation: first Conv2d weight summed across RGB channel dim,
+                  preserving pretrained filter energy.
+
+  Fusion:  Modality attention gates at decoder levels 1 & 2.
+           Levels 3–5 use a single fused representation.
+
+  Forward signature:
+    model(rgb: Tensor[B,3,H,W], irt: Tensor[B,1,H,W]) → logits: Tensor[B,num_classes,H,W]
+
+5.3 ModalityAttention  (inside LateFusionSegmentationModel)
+------------------------------------------------------------
+File: late_fusion_model.py
+
+  Learns per-pixel importance weights for each modality at a given decoder level.
+  Output: weighted combination of RGB and IRT features.
+  Applied only at coarse resolutions (levels 1 & 2) where cross-modal context
+  contributes most to segmentation accuracy.
+
+
+================================================================================
+6. TRAINING PIPELINE
+================================================================================
+
+Entry class for single-modal:  DefectDetectionPipeline  (CNNVIT.py)
+Entry class for dual-modal:    LateFusionPipeline        (CNNVIT.py)
+Core trainer:                  DefectDetectionTrainer    (CNNVIT.py)
+
+DefectDetectionTrainer auto-detects batch type:
+  - Batch has key "image"       → single-modal forward path
+  - Batch has keys "rgb"/"irt"  → dual-modal forward path
+This allows the same trainer class to be shared between both pipelines.
+
+6.1 Loss Function
+-----------------
+  torch.nn.CrossEntropyLoss(
+      weight      = class_weights,   # [0.2, 3.0, 2.0, 1.0, 3.0]
+      ignore_index = -1              # masks invalid/border pixels
+  )
+
+  Class weights:
+    Background   (0): 0.2   ← heavily downweighted; dominates pixel count
+    Crack        (1): 3.0   ← upweighted; thin, rare feature
+    Spall        (2): 2.0
+    Delamination (3): 1.0   ← neutral; no annotations yet
+    Moisture     (4): 3.0   ← upweighted; irregular shape, rare
+
+6.2 Optimizer & Scheduler
+--------------------------
+  Optimizer: Adam
+    lr           = 0.001
+    weight_decay = 0.0001
+
+  Scheduler: ReduceLROnPlateau
+    mode         = 'max'     (monitored metric: validation mean IoU)
+    factor       = 0.5       (halve LR on plateau)
+    patience     = 10 epochs
+
+6.3 Gradient Clipping
+----------------------
+  torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+  Applied every training step before optimizer.step().
+
+6.4 Checkpointing
+-----------------
+  Saved when validation mean IoU improves.
+  Filename pattern:
+    best_single_modal_epoch{epoch:03d}.pth   (single-modal)
+    best_late_fusion_epoch{epoch:03d}.pth    (late fusion)
+
+  Checkpoint contents:
+    {
+      "epoch":           int,
+      "model_state":     model.state_dict(),
+      "optimizer_state": optimizer.state_dict(),
+      "metrics":         dict,
+      "best_metric":     float
+    }
+
+6.5 Early Stopping
+------------------
+  Monitored metric: validation mean IoU
+  Patience:         20 epochs (early_stopping_patience in config)
+  Behavior:         Training halts if no improvement for 20 consecutive epochs.
+
+
+================================================================================
+7. EVALUATION METRICS
+================================================================================
+
+Class: DefectDetectionMetrics  (CNNVIT.py)
+
+Implemented via confusion matrix accumulation (per-pixel predictions vs GT).
+
+Metrics computed per epoch:
+  - Accuracy (Overall):   sum(diagonal) / sum(confusion matrix)
+  - Per-class IoU:        TP / (TP + FP + FN)
+  - Mean IoU:             mean of per-class IoU  ← primary checkpoint metric
+  - Per-class Dice:       2·TP / (sum(pred_class) + sum(gt_class))
+  - Mean Dice:            mean of per-class Dice
+  - Macro F1 (defects):   mean F1 over classes 1–4 only (background excluded)
+                           F1 = 2·P·R / (P + R)
+
+Output dict structure:
+  {
+    "loss":          float,
+    "accuracy":      float,
+    "mean_iou":      float,
+    "mean_dice":     float,
+    "macro_f1":      float,
+    "iou_per_class": [float, float, float, float, float],
+    "dice_per_class":[float, float, float, float, float]
+  }
+
+Note: Macro F1 excludes background to focus evaluation on defect classes.
+
+
+================================================================================
+8. CONFIGURATION REFERENCE (config.yaml)
+================================================================================
+
+dataset:
+  xml_annotation     — path to CVAT 1.1 source XML
+  annotation_dir     — output directory for COCO JSON files
+  rgb_dir            — RGB image directory
+  irt_dir            — IRT thermal image directory
+  fused_dir          — fused image directory (single-modal)
+  image_size         — 512  (all images resized to 512×512)
+  num_classes        — 5    (background + 4 defect types)
+  train_ratio        — 0.8  (80/20 train/val split)
+
+classes:
+  names              — {0:background, 1:crack, 2:spall, 3:delamination, 4:moisture}
+  weights            — [0.2, 3.0, 2.0, 1.0, 3.0]
+
+model:
+  backbone           — "mobilevit_s"
+  pretrained         — true
+  hidden_dim         — 256  (decoder intermediate channels)
+
+training:
+  batch_size               — 4  (Late Fusion; use 8 for single-modal)
+  num_epochs               — 20  (set low for trial runs; full training: 100)
+  learning_rate            — 0.001
+  weight_decay             — 0.0001
+  optimizer                — "adam"
+  scheduler                — "reduce_on_plateau"
+  scheduler_patience       — 10
+  gradient_clip            — 1.0
+  early_stopping_patience  — 20
+  val_frequency            — 1   (validate every epoch)
+
+augmentation:
+  (all geometric and photometric transforms with configurable probabilities)
+
+checkpoint:
+  save_dir           — directory for .pth checkpoint files
+
+logging:
+  level              — log verbosity (INFO by default)
+
+device:
+  (auto-detected: CUDA if available, else CPU)
+
+
+================================================================================
+9. FILE / MODULE REFERENCE
+================================================================================
+
+  CNNVIT.py            — Core module. Contains:
+                           MobileViTSegmentationHead
+                           MobileViTSegmentationModel
+                           DefectDetectionMetrics
+                           DefectDetectionTrainer
+                           DefectDetectionPipeline  (single-modal)
+                           LateFusionPipeline        (dual-modal)
+                           main() entry point
+
+  late_fusion_model.py — Dual-backbone model. Contains:
+                           ModalityAttention
+                           LateFusionDecoder
+                           LateFusionSegmentationModel
+
+  dataset.py           — Dataset classes. Contains:
+                           COCOSegmentationDataset   (single-modal)
+                           MultiModalDataset          (dual-modal)
+
+  dataset_utils.py     — Annotation utilities. Contains:
+                           CVATXMLToCOCOConverter
+                           Helper functions for dataset preparation
+
+  config.yaml          — Central configuration file.
+
+  visualization.py     — Visualization utilities for predictions and masks.
+
+  quickstart.py        — Quick-start / demo script.
+
+  prepare_dataset.py   — Dataset preparation script.
+
+  test_installation.py — Environment validation (checks torch, timm, etc.)
+
+  annotations.xml      — Source CVAT 1.1 annotation file.
+
+  RGB_FITTED/          — RGB image directory (69 images, PNG).
+  IRT_FITTED/          — IRT thermal image directory (69 images, JPG).
+  FUSED/               — Pre-fused images for single-modal training.
+  dataset/             — COCO JSON output (instances_train.json, instances_val.json).
+  checkpoints/         — Saved model checkpoints (.pth files).
+  requirements.txt     — Python dependencies.
+
+
+================================================================================
+10. NOTABLE DESIGN DECISIONS
+================================================================================
+
+1. LATE FUSION OVER EARLY FUSION
+   RGB and IRT are processed by separate backbones and fused only at the decoder.
+   This lets each modality develop independent high-level representations before
+   being combined, which is beneficial when modalities carry complementary
+   (not just redundant) information (e.g., RGB captures surface texture; IRT
+   captures subsurface thermal anomalies).
+
+2. MODALITY ATTENTION AT COARSE SCALES ONLY
+   Modality attention gates are applied at decoder levels 1 & 2 (lowest
+   resolution). At coarse scales, spatial context is wide enough for the model
+   to learn where each modality is informative. Higher-resolution levels (3–5)
+   use a single fused pathway to save memory and computation.
+
+3. THERMAL CHANNEL ADAPTATION
+   The IRT backbone's first Conv2d is converted from 3-channel to 1-channel by
+   summing pretrained RGB filters. This preserves the energy/magnitude of the
+   original pretrained filters, allowing the thermal backbone to leverage
+   ImageNet pretraining despite the different input modality.
+
+4. CRACK RENDERING AS POLYLINES
+   Cracks are annotated as polylines in CVAT and rendered as thick lines
+   (width = 10 px) rather than filled polygons. This matches the actual
+   morphology of cracks (thin, elongated features) and avoids incorrect area
+   masks that filled polygon rendering would produce.
+
+5. SYNCHRONIZED MULTI-MODAL AUGMENTATION
+   Using albumentations' `additional_targets` ensures that spatial transforms
+   (flips, rotations, shifts) are applied identically to RGB image, IRT image,
+   and segmentation mask. Applying transforms independently would cause
+   pixel-level misalignment between modalities and labels.
+
+6. SHARED TRAINER FOR BOTH PIPELINES
+   DefectDetectionTrainer detects the batch type (single vs. multi-modal) via
+   dict keys and dispatches to the appropriate forward path. This avoids code
+   duplication and ensures both pipelines share the same training logic,
+   metric computation, and checkpointing behavior.
+
+7. BACKGROUND DOWNWEIGHTING
+   Background pixels are assigned a class weight of 0.2. Without downweighting,
+   the model would be incentivized to predict everything as background and
+   still achieve high accuracy, ignoring rare defect classes.
+
+8. IGNORE INDEX FOR INVALID PIXELS
+   The loss function uses ignore_index=-1, allowing any pixel labeled -1 to be
+   excluded from loss computation. This supports masking image borders, padding
+   regions, or any area the annotator explicitly left unlabeled.
+
+9. ANNOTATION AUTO-REGENERATION
+   The main() entry point checks whether COCO JSON files exist and are non-empty.
+   If not, it automatically triggers CVATXMLToCOCOConverter to (re)generate them.
+   This makes the pipeline self-contained from raw CVAT annotations.
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
