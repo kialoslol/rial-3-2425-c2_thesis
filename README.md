@@ -1,316 +1,59 @@
-# MobileViT V3 Hybrid CNN-ViT Defect Detection Model
+# UAV Defect Detection — MobileViTv2 Early Fusion
 
-## Overview
-This project implements a **MobileViT V3-based semantic segmentation model** for real-world defect detection (cracks, spalls, moisture) with comprehensive metrics including accuracy, mAP, IoU, F1-score, and Dice coefficient.
-
-### Architecture
-- **Backbone**: MobileViTv2_100 (fusion of CNN + Vision Transformer)
-- **Task**: Semantic segmentation + Instance detection
-- **Input**: COCO-formatted dataset (supports RGB + Thermal fusion)
-- **Output**: Per-pixel segmentation masks with multi-modal analysis
+Semantic segmentation of structural defects from **RGB + Infrared (IR) fused aerial imagery**, using a **MobileViTv2-100 Early Fusion** model trained end-to-end with Focal + Dice loss.
 
 ---
 
-## Dataset Setup Guide
+## Architecture
 
-### **Your Current Dataset Structure**
-You have:
-- `RGB` images
-- `Thermal` images  
-- `Fused` images
-- `XML` files (annotations)
-- `ZIP` files
+| Component | Detail |
+|---|---|
+| Backbone | MobileViTv2-100 (pretrained, ImageNet) |
+| Fusion strategy | **Early Fusion** — 4-channel RGBT input projected to 3-ch via learnable 1×1 conv |
+| Decoder | 5-stage bilinear upsampling head (32× total) |
+| Loss | Focal Loss (γ=2, weight=0.4) + Soft Dice (weight=0.6) |
+| LR schedule | Linear warmup → Cosine annealing |
+| Input size | 256 × 256 (fused TIFF) |
+| Output | Per-pixel class mask `[B, 5, H, W]` |
 
-### **Required COCO Format**
-The model requires **COCO JSON annotation format**:
+### Class Map
 
-```
-dataset/
-├── train/
-│   ├── *.jpg, *.png, *.tiff, *.tif  (images)
-│   └── (optional) *.xml (will be converted)
-├── val/
-│   ├── *.jpg, *.png, *.tiff, *.tif
-│   └── (optional) *.xml
-├── instances_train.json    ← COCO annotations
-└── instances_val.json      ← COCO annotations
-```
-
-### **COCO JSON Format Example**
-```json
-{
-  "info": {
-    "description": "Defect Detection Dataset",
-    "version": "1.0",
-    "year": 2024
-  },
-  "licenses": [],
-  "images": [
-    {
-      "id": 1,
-      "file_name": "train/image001.jpg",
-      "height": 1024,
-      "width": 1024
-    }
-  ],
-  "annotations": [
-    {
-      "id": 1,
-      "image_id": 1,
-      "category_id": 1,
-      "bbox": [100, 150, 200, 250],
-      "area": 50000,
-      "iscrowd": 0,
-      "segmentation": []
-    }
-  ],
-  "categories": [
-    {"id": 0, "name": "background", "supercategory": "defect"},
-    {"id": 1, "name": "cracks", "supercategory": "defect"},
-    {"id": 2, "name": "spalls", "supercategory": "defect"},
-    {"id": 3, "name": "moisture", "supercategory": "defect"}
-  ]
-}
-```
-
-### **Step 1: Convert XML Annotations to COCO**
-
-If your annotations are in **Pascal VOC XML format**:
-
-```python
-from dataset_utils import XMLToCOCOConverter
-
-# Initialize converter
-converter = XMLToCOCOConverter(
-    image_dir="path/to/your/images",
-    annotation_dir="path/to/your/xml_annotations"
-)
-
-# Register defect categories
-converter.register_categories({
-    'cracks': 1,
-    'spalls': 2,
-    'moisture': 3
-})
-
-# Convert to COCO format
-converter.convert_to_coco(
-    output_json="instances_train.json",
-    split='train'
-)
-
-converter.convert_to_coco(
-    output_json="instances_val.json",
-    split='val'
-)
-```
-
-### **Step 2: Fuse RGB + Thermal Images (Optional)**
-
-If using both RGB and thermal images:
-
-```python
-from dataset_utils import MultimodalImageFusion
-
-# Create 4-channel RGBT images
-MultimodalImageFusion.create_4channel_dataset(
-    rgb_dir="path/to/rgb_images",
-    thermal_dir="path/to/thermal_images",
-    output_dir="path/to/output_4channel"
-)
-```
-
-This creates **4-channel images** (B, G, R, Thermal) for better defect detection.
-
-### **Step 3: Organize Dataset**
-
-```python
-from dataset_utils import DatasetOrganizer
-
-DatasetOrganizer.organize_dataset(
-    source_dir="path/to/all/images",
-    output_dir="path/to/organized/dataset",
-    split_ratios={'train': 0.7, 'val': 0.15, 'test': 0.15}
-)
-```
+| ID | Class | Notes |
+|---|---|---|
+| 0 | Background | Dominant class; down-weighted by Focal Loss |
+| 1 | Crack | Surface fractures |
+| 2 | Spall | Concrete spalling / delamination |
+| 3 | Delamination | Reserved (no annotations in current dataset) |
+| 4 | Moisture | Moisture infiltration; inverse-frequency boosted ×1.8 |
 
 ---
 
-## Installation
+## Training Results (EarlyFusionPipelineV2 — 200 epochs)
 
-### **Requirements**
-- Python 3.8+
-- CUDA 11.0+ (for GPU acceleration)
+### Best Validation Metrics (Epoch 200)
 
-### **Step 1: Install Dependencies**
+| Metric | Value |
+|---|---|
+| Loss | 0.4110 |
+| Pixel Accuracy | 71.89% |
+| Mean IoU | 47.12% |
+| Mean Dice | 58.95% |
+| Macro F1 | 52.82% |
+| mAP | 51.59% |
 
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+### Per-Class Breakdown
 
-pip install timm pycocotools opencv-python numpy tqdm pyyaml matplotlib seaborn scikit-learn
-```
+| Class | Accuracy | IoU | Dice | Precision | Recall | F1 |
+|---|---|---|---|---|---|---|
+| Background | 0.7295 | 0.7158 | 0.8344 | 0.9950 | 0.7184 | 0.8344 |
+| Crack | 0.9858 | 0.4467 | 0.6175 | 0.5491 | 0.7054 | 0.6175 |
+| Spall | 0.9901 | 0.5955 | 0.7465 | 0.7552 | 0.7379 | 0.7465 |
+| Delamination | 0.9924 | 0.5978 | 0.7483 | 0.7588 | 0.7380 | 0.7483 |
+| Moisture | 0.7401 | 0.0003 | 0.0006 | 0.0003 | 0.8696 | 0.0006 |
 
-### **Step 2: Verify Installation**
+> **Note on Moisture:** Near-zero IoU/F1 despite high recall (0.87) indicates the model predicts moisture almost everywhere — a class imbalance problem. High recall but extremely low precision (0.03%) means false positives dominate. Addressed in future work.
 
-```bash
-python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
-```
-
----
-
-## Configuration
-
-Edit `config.yaml` for your dataset and training parameters:
-
-```yaml
-dataset:
-  root_dir: "c:/Users/David/Documents/DLSU/THESIS/dataset"
-  train_annotation_file: "instances_train.json"
-  val_annotation_file: "instances_val.json"
-  image_size: 512
-  num_classes: 4
-
-training:
-  batch_size: 8
-  num_epochs: 100
-  learning_rate: 0.001
-  weight_decay: 0.0001
-
-augmentation:
-  enable: true
-  random_flip: true
-  random_rotation: true
-  color_jitter: true
-  gaussian_blur: true
-  gaussian_noise: true
-```
-
----
-
-## Data Augmentation
-
-The model uses **comprehensive augmentation**:
-- ✅ **Geometric**: Random flips (H/V), rotations (±15°), affine transforms
-- ✅ **Color**: Brightness, contrast, saturation, hue jittering
-- ✅ **Blur**: Gaussian blur with random kernel sizes
-- ✅ **Noise**: Gaussian noise injection for robustness
-
-These improve model generalization and reduce overfitting on small datasets.
-
----
-
-## Training
-
-### **Basic Training**
-
-```python
-from CNNVIT import DefectDetectionPipeline
-
-pipeline = DefectDetectionPipeline(
-    dataset_root="c:/path/to/dataset",
-    num_classes=4,
-    batch_size=8,
-    num_epochs=100,
-    image_size=512
-)
-
-history = pipeline.train(
-    train_annotation_file='instances_train.json',
-    val_annotation_file='instances_val.json'
-)
-```
-
-### **With Configuration File**
-
-```python
-import yaml
-from CNNVIT import DefectDetectionPipeline
-
-with open('config.yaml', 'r') as f:
-    config = yaml.safe_load(f)
-
-pipeline = DefectDetectionPipeline(
-    dataset_root=config['dataset']['root_dir'],
-    num_classes=config['dataset']['num_classes'],
-    batch_size=config['training']['batch_size'],
-    num_epochs=config['training']['num_epochs']
-)
-
-history = pipeline.train()
-```
-
----
-
-## Inference
-
-### **Single Image Prediction**
-
-```python
-prediction = pipeline.predict(
-    image_path='path/to/test/image.jpg',
-    checkpoint_path='./checkpoints/best_model_epoch_0.pth'
-)
-
-# prediction contains:
-# - mask: segmentation mask with class IDs
-# - image: original image
-# - image_shape: original dimensions
-```
-
-### **Batch Prediction**
-
-```python
-results = pipeline.batch_predict(
-    image_dir='path/to/test/images',
-    checkpoint_path='./checkpoints/best_model_epoch_0.pth',
-    output_dir='./predictions'
-)
-```
-
----
-
-## Metrics & Visualization
-
-### **Available Metrics**
-- **Accuracy**: Pixel-level classification accuracy
-- **IoU (mIoU)**: Intersection over Union for segmentation
-- **Dice Coefficient**: F1-like metric for defect regions
-- **F1-Score**: Harmonic mean of precision and recall
-- **mAP**: Mean Average Precision (COCO style)
-
-### **Visualizations**
-
-```python
-from visualization import DefectVisualization
-
-viz = DefectVisualization(output_dir="./visualizations")
-
-# Plot training history
-viz.plot_training_history(history)
-
-# Plot confusion matrix
-viz.plot_confusion_matrix(trainer.metrics.confusion_matrix)
-
-# Plot segmentation results
-viz.plot_segmentation_results(
-    image=image,
-    ground_truth_mask=gt_mask,
-    predicted_mask=pred_mask
-)
-
-# Compare metrics
-metrics = {
-    'accuracy': 0.92,
-    'iou': 0.87,
-    'dice': 0.89,
-    'f1_score': 0.88,
-    'map': 0.85
-}
-viz.plot_metrics_comparison(metrics)
-
-# Defect distribution
-viz.plot_defect_distribution(all_masks)
-```
+Best checkpoint: `checkpoints/best_early_fusion_v2_epoch199.pth`
 
 ---
 
@@ -318,137 +61,246 @@ viz.plot_defect_distribution(all_masks)
 
 ```
 THESIS/
-├── CNNVIT.py                 # Main model architecture
-├── dataset_utils.py          # Dataset conversion utilities
-├── visualization.py          # Visualization tools
-├── config.yaml              # Configuration file
-├── README.md                # This file
-├── checkpoints/             # Saved models
-├── visualizations/          # Output visualizations
-├── predictions/             # Inference outputs
-└── dataset/                 # Your COCO dataset
-    ├── train/
-    ├── val/
+├── CNNVIT.py               # Base model, trainer, metrics (DefectDetectionTrainer, DefectDetectionMetrics)
+├── CNNVIT_v2.py            # EarlyFusionPipelineV2 — main training pipeline
+├── late_fusion_model.py    # Late Fusion variant (separate RGB + IR streams)
+├── channelstack.py         # Fuses RGB + IR TIFFs into 4-channel files
+├── dataset.py              # COCOSegmentationDataset — data loading
+├── dataset_utils.py        # CVAT XML → COCO JSON converter, dataset tools
+├── visualization.py        # Training curves, confusion matrix, segmentation overlays
+├── dashboard.py            # Streamlit inference dashboard
+├── prepare_dataset.py      # Dataset preparation script
+├── config.yaml             # All training hyperparameters
+├── checkpoints/            # Saved model weights + training_history.json
+├── visualizations/         # Output plots (training_history.png, confusion_matrix.png)
+└── dataset/                # COCO-formatted dataset
     ├── instances_train.json
     └── instances_val.json
 ```
 
 ---
 
-## Workflow Summary
+## Installation
 
-1. **Prepare Dataset**
-   ```bash
-   # Convert XML to COCO JSON
-   python -c "from dataset_utils import XMLToCOCOConverter; ..."
-   ```
+**Requirements:** Python 3.8+, CUDA 11.0+ (recommended)
 
-2. **Update config.yaml** with your dataset path and parameters
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
-3. **Train Model**
-   ```bash
-   python CNNVIT.py
-   ```
+pip install timm pycocotools opencv-python numpy tqdm pyyaml \
+            matplotlib seaborn scikit-learn streamlit
+```
 
-4. **Visualize Results**
-   ```bash
-   python -c "from visualization import DefectVisualization; ..."
-   ```
-
-5. **Run Inference**
-   ```python
-   pipeline.predict('test_image.jpg', 'checkpoints/best_model.pth')
-   ```
+Verify:
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
 
 ---
 
-## GPU Acceleration
+## Dataset Setup
 
-Enable CUDA for faster training:
+### 1 — Fuse RGB + IR into 4-channel TIFFs
+
+```bash
+python channelstack.py
+```
+
+This writes `.tiff` files containing [R, G, B, IR] channels into the configured fused output directory.
+
+### 2 — Convert CVAT XML annotations to COCO JSON
+
+This runs automatically on first training via `CVATXMLToCOCOConverter` inside `CNNVIT_v2.py`, or manually:
 
 ```python
-import torch
-print(f"GPU Available: {torch.cuda.is_available()}")
-print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+from dataset_utils import CVATXMLToCOCOConverter
 
-# Automatically uses GPU if available
-pipeline = DefectDetectionPipeline(...)
+converter = CVATXMLToCOCOConverter("path/to/annotations.xml")
+converter.convert(
+    output_train="instances_train.json",
+    output_val="instances_val.json",
+    train_ratio=0.8
+)
 ```
+
+### 3 — Expected Dataset Layout
+
+```
+dataset/
+├── fused/
+│   ├── fuse_Binondo/   ← 4-channel .tiff files
+│   ├── FUSED/
+│   └── ...
+├── instances_train.json
+└── instances_val.json
+```
+
+---
+
+## Configuration (`config.yaml`)
+
+```yaml
+dataset:
+  fused_dir:             "c:/Users/David/Documents/DLSU/THESIS/dataset/fused"
+  annotation_dir:        "c:/Users/David/Documents/DLSU/THESIS/dataset"
+  train_annotation_file: "instances_train.json"
+  val_annotation_file:   "instances_val.json"
+  xml_annotation:        "path/to/annotations.xml"
+  num_classes: 5
+  image_size:  256
+  train_ratio: 0.8
+
+training:
+  batch_size:               4
+  num_epochs:               200
+  learning_rate:            0.001
+  weight_decay:             0.0001
+  early_stopping_patience:  20
+
+checkpoint:
+  save_dir: "./checkpoints"
+```
+
+---
+
+## Training
+
+```bash
+python CNNVIT_v2.py
+```
+
+The pipeline will:
+1. Convert CVAT XML → COCO JSON (skipped if already exists)
+2. Compute data-driven class weights from annotation pixel counts
+3. Train with Focal + Dice loss and cosine LR schedule
+4. Save the best checkpoint to `checkpoints/best_early_fusion_v2_epochXXX.pth`
+5. Save the full training history to `checkpoints/training_history.json`
+
+To train programmatically:
+
+```python
+from CNNVIT_v2 import EarlyFusionPipelineV2
+
+pipeline = EarlyFusionPipelineV2(
+    fused_dir="./dataset/fused",
+    annotation_dir="./dataset",
+    num_classes=5,
+    batch_size=4,
+    num_epochs=200,
+    image_size=256,
+    checkpoint_dir="./checkpoints",
+    lr=1e-3,
+)
+
+history = pipeline.train(
+    train_annotation="instances_train.json",
+    val_annotation="instances_val.json",
+    early_stop_patience=20,
+)
+```
+
+---
+
+## Visualization
+
+After training, generate plots from the saved history file:
+
+```bash
+python visualization.py
+# or specify a custom path:
+python visualization.py ./checkpoints/training_history.json
+```
+
+This produces two files in `./visualizations/`:
+
+| File | Contents |
+|---|---|
+| `training_history.png` | 6-panel grid: Loss, Accuracy, IoU, Dice, F1, mAP — Train vs Val per epoch, best epoch annotated |
+| `confusion_matrix.png` | Pixel-count heatmap (normalized by row) + per-class Precision/Recall/F1 bar chart |
+
+To call from code:
+
+```python
+from visualization import DefectVisualization
+import json, numpy as np
+
+with open("checkpoints/training_history.json") as f:
+    history = json.load(f)
+
+best_ep = int(np.argmax([h["mean_iou"] for h in history["val"]]))
+cm = np.array(history["val"][best_ep]["confusion_matrix"])
+
+viz = DefectVisualization(output_dir="./visualizations")
+viz.plot_training_history(history)
+viz.plot_confusion_matrix(cm, class_names=["Background","Crack","Spall","Delamination","Moisture"])
+```
+
+---
+
+## Inference
+
+### Single fused TIFF
+
+```python
+from CNNVIT_v2 import EarlyFusionPipelineV2
+
+pipeline = EarlyFusionPipelineV2(
+    fused_dir="./dataset/fused",
+    annotation_dir="./dataset",
+    num_classes=5,
+)
+
+result = pipeline.predict(
+    fused_path="./dataset/fused/fuse_Binondo/000001.tiff",
+    checkpoint_path="./checkpoints/best_early_fusion_v2_epoch199.pth"
+)
+
+# result["mask"]  — H×W numpy array of class IDs (0–4)
+# result["rgb"]   — H×W×3 RGB image
+```
+
+### Streamlit Dashboard
+
+```bash
+streamlit run dashboard.py
+```
+
+---
+
+## Data Augmentation
+
+Applied to the training split only:
+
+| Type | Transform |
+|---|---|
+| Geometric | Random horizontal/vertical flip, rotation ±15°, affine |
+| Color | Brightness, contrast, saturation, hue jitter |
+| Blur | Gaussian blur (random kernel) |
+| Noise | Gaussian noise injection |
 
 ---
 
 ## Troubleshooting
 
-### **Dataset Not Found**
-- Ensure `instances_train.json` and `instances_val.json` exist in dataset root
-- Verify file paths use forward slashes `/` or raw strings `r"path"`
+**Out of memory (OOM)**
+- Reduce `batch_size` (current: 4) or `image_size` (current: 256)
 
-### **OOM Error (Out of Memory)**
-- Reduce `batch_size` in config.yaml
-- Reduce `image_size` (e.g., 256 or 384)
+**Moisture IoU near zero**
+- The class is severely imbalanced. The current ×1.8 weight boost is insufficient. Consider oversampling moisture images, using a higher boost factor, or a threshold-based post-processing step.
 
-### **Low Metrics**
-- Check data augmentation is properly configured
-- Verify annotation format matches COCO standard
-- Increase number of epochs or adjust learning rate
+**COCO JSON missing / empty**
+- Re-run `CVATXMLToCOCOConverter.convert()` and verify the XML contains `<polygon>` annotations for all defect classes.
 
-### **Slow Training**
-- Use GPU (CUDA): Check `torch.cuda.is_available()`
-- Reduce `num_workers` if causing issues
-- Use mixed precision: Set `mixed_precision: true` in config
-
----
-
-## Advanced Features
-
-### **Multi-GPU Training**
-```python
-model = nn.DataParallel(model)
-```
-
-### **Mixed Precision Training**
-Enable in config.yaml for faster training with lower memory:
-```yaml
-device:
-  mixed_precision: true
-```
-
-### **Custom Loss Functions**
-Modify `MobileViTSegmentationModel` to use:
-- Focal Loss for imbalanced classes
-- Dice Loss for better segmentation
-- Lovasz Loss for IoU optimization
+**Slow training (~2 min/epoch on CPU)**
+- Confirm CUDA is available: `python -c "import torch; print(torch.cuda.is_available())"`
+- Reduce `num_workers` in `DataLoader` if encountering deadlocks on Windows.
 
 ---
 
 ## References
 
-- [MobileViT Paper](https://arxiv.org/abs/2110.02178)
+- Mehta & Rastegari — [MobileViT (2021)](https://arxiv.org/abs/2110.02178)
+- Mehta & Rastegari — [Separable Self-Attention for MobileViTv2 (2022)](https://arxiv.org/abs/2206.02680)
+- Lin et al. — [Focal Loss (RetinaNet, 2017)](https://arxiv.org/abs/1708.02002)
 - [COCO Dataset Format](https://cocodataset.org/#format-data)
-- [PyTorch Segmentation](https://pytorch.org/vision/stable/segmentation.html)
-- [timm Models](https://github.com/rwightman/pytorch-image-models)
-
----
-
-## License & Citation
-
-If you use this model in your thesis, please cite:
-
-```bibtex
-@article{mehta2021mobilevit,
-  title={MobileViT: Light-weight Vision Transformers},
-  author={Mehta, Sachin and Rastegari, Mohammad},
-  journal={arXiv preprint arXiv:2110.02178},
-  year={2021}
-}
-```
-
----
-
-## Support
-
-For issues or questions:
-1. Check the troubleshooting section
-2. Verify dataset format matches examples
-3. Enable debug logging: Set `logging.level: DEBUG` in config.yaml
-
+- [timm — PyTorch Image Models](https://github.com/huggingface/pytorch-image-models)
