@@ -57,22 +57,32 @@ def _build_augmentation_pipeline(image_size: int, augment: bool) -> A.Compose:
         A.RandomRotate90(p=0.5),
         A.Affine(
             translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
-            scale=(0.9, 1.1),
-            rotate=(-15, 15),
+            scale=(0.85, 1.15),
+            rotate=(-20, 20),
             border_mode=cv2.BORDER_CONSTANT,
             fill=0,
             fill_mask=0,
             p=0.5,
         ),
+        # ElasticTransform: deforms crack-like thin structures realistically
+        A.ElasticTransform(alpha=80, sigma=8, p=0.2),
+        # GridDistortion: simulates surface warp from different camera angles
+        A.GridDistortion(num_steps=5, distort_limit=0.2, p=0.2),
     ] if augment else [
         A.Resize(image_size, image_size, interpolation=cv2.INTER_LINEAR,
                  mask_interpolation=cv2.INTER_NEAREST),
     ]
 
     photometric = [
-        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
-        A.GaussianBlur(blur_limit=(3, 5), p=0.3),
+        # Stronger brightness/contrast — moisture is highly lighting-dependent
+        A.RandomBrightnessContrast(brightness_limit=0.35, contrast_limit=0.35, p=0.6),
+        A.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.1, p=0.5),
+        # CLAHE sharpens local contrast; helps distinguish moisture patches
+        A.CLAHE(clip_limit=3.0, tile_grid_size=(8, 8), p=0.4),
+        A.GaussianBlur(blur_limit=(3, 7), p=0.3),
         A.GaussNoise(std_range=(0.01, 0.05), p=0.3),
+        # Sharpen to recover edge detail lost after blur/noise
+        A.Sharpen(alpha=(0.1, 0.3), lightness=(0.8, 1.2), p=0.3),
     ] if augment else []
 
     return A.Compose(spatial + photometric)

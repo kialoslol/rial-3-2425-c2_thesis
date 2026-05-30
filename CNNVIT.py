@@ -174,36 +174,45 @@ class DefectDetectionMetrics:
         # Pixel accuracy
         accuracy = np.diag(cm).sum() / (cm.sum() + 1e-7)
 
-        # Per-class precision, recall, F1 (all classes including background)
+        total = cm.sum()
+
+        # Per-class precision, recall, F1, and per-class accuracy (one-vs-rest)
         precision_per_class = []
         recall_per_class    = []
         f1_per_class        = []
+        accuracy_per_class  = []
         for c in range(self.num_classes):
-            tp   = cm[c, c]
-            fp   = cm[:, c].sum() - tp
-            fn   = cm[c, :].sum() - tp
+            tp = cm[c, c]
+            fp = cm[:, c].sum() - tp
+            fn = cm[c, :].sum() - tp
+            tn = total - tp - fp - fn
+
             prec = float(tp / (tp + fp + 1e-7))
             rec  = float(tp / (tp + fn + 1e-7))
             f1   = float(2 * prec * rec / (prec + rec + 1e-7))
+            acc  = float((tp + tn) / (total + 1e-7))   # one-vs-rest accuracy
+
             precision_per_class.append(prec)
             recall_per_class.append(rec)
             f1_per_class.append(f1)
+            accuracy_per_class.append(acc)
 
         # Aggregate over defect classes only (skip background=0)
         defect_prec = precision_per_class[1:]
         defect_f1   = f1_per_class[1:]
 
         return {
-            "accuracy":           float(accuracy),
-            "mean_iou":           float(np.mean(iou_per_class)),
-            "mean_dice":          float(np.mean(dice_per_class)),
-            "macro_f1":           float(np.mean(defect_f1))   if defect_f1   else 0.0,
-            "mAP":                float(np.mean(defect_prec)) if defect_prec else 0.0,
-            "iou_per_class":      iou_per_class,
-            "dice_per_class":     dice_per_class,
+            "accuracy":            float(accuracy),
+            "mean_iou":            float(np.mean(iou_per_class)),
+            "mean_dice":           float(np.mean(dice_per_class)),
+            "macro_f1":            float(np.mean(defect_f1))   if defect_f1   else 0.0,
+            "mAP":                 float(np.mean(defect_prec)) if defect_prec else 0.0,
+            "iou_per_class":       iou_per_class,
+            "dice_per_class":      dice_per_class,
             "precision_per_class": precision_per_class,
-            "recall_per_class":   recall_per_class,
-            "f1_per_class":       f1_per_class,
+            "recall_per_class":    recall_per_class,
+            "f1_per_class":        f1_per_class,
+            "accuracy_per_class":  accuracy_per_class,
         }
 
     # Legacy single-call interface (used by progress bars)
@@ -240,20 +249,21 @@ def _log_final_metrics(metrics: dict, label: str = "Final") -> None:
     logger.info("  %-16s %.4f", "Macro F1:",  metrics.get("macro_f1",  0.0))
     logger.info("  %-16s %.4f", "mAP:",       metrics.get("mAP",       0.0))
     logger.info(sep)
-    logger.info("  %-14s  %7s  %7s  %9s  %7s  %7s",
-                "Class", "IoU", "Dice", "Precision", "Recall", "F1")
-    logger.info("  %-14s  %7s  %7s  %9s  %7s  %7s",
-                "─" * 14, "─" * 7, "─" * 7, "─" * 9, "─" * 7, "─" * 7)
-    iou_list   = metrics.get("iou_per_class",       [])
-    dice_list  = metrics.get("dice_per_class",      [])
-    prec_list  = metrics.get("precision_per_class", [])
-    rec_list   = metrics.get("recall_per_class",    [])
-    f1_list    = metrics.get("f1_per_class",        [])
-    for i, vals in enumerate(zip(iou_list, dice_list, prec_list, rec_list, f1_list)):
-        iou, dice, prec, rec, f1 = vals
+    logger.info("  %-14s  %8s  %7s  %7s  %9s  %7s  %7s",
+                "Class", "Accuracy", "IoU", "Dice", "Precision", "Recall", "F1")
+    logger.info("  %-14s  %8s  %7s  %7s  %9s  %7s  %7s",
+                "─" * 14, "─" * 8, "─" * 7, "─" * 7, "─" * 9, "─" * 7, "─" * 7)
+    iou_list  = metrics.get("iou_per_class",       [])
+    dice_list = metrics.get("dice_per_class",      [])
+    prec_list = metrics.get("precision_per_class", [])
+    rec_list  = metrics.get("recall_per_class",    [])
+    f1_list   = metrics.get("f1_per_class",        [])
+    acc_list  = metrics.get("accuracy_per_class",  [])
+    for i, vals in enumerate(zip(acc_list, iou_list, dice_list, prec_list, rec_list, f1_list)):
+        acc, iou, dice, prec, rec, f1 = vals
         name = _CLASS_NAMES[i] if i < len(_CLASS_NAMES) else f"class_{i}"
-        logger.info("  %-14s  %7.4f  %7.4f  %9.4f  %7.4f  %7.4f",
-                    name, iou, dice, prec, rec, f1)
+        logger.info("  %-14s  %8.4f  %7.4f  %7.4f  %9.4f  %7.4f  %7.4f",
+                    name, acc, iou, dice, prec, rec, f1)
     logger.info(sep)
 
 
@@ -324,6 +334,7 @@ class DefectDetectionTrainer:
 
         result = metrics.compute()
         result["loss"] = total_loss / len(loader)
+        result["confusion_matrix"] = metrics.confusion_matrix.tolist()
         return result
 
     def validate(self, loader: DataLoader, num_classes: int) -> Dict[str, float]:
@@ -340,6 +351,7 @@ class DefectDetectionTrainer:
 
         result = metrics.compute()
         result["loss"] = total_loss / len(loader)
+        result["confusion_matrix"] = metrics.confusion_matrix.tolist()
         return result
 
     # ------------------------------------------------------------------

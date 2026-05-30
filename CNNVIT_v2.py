@@ -29,38 +29,51 @@ logger = logging.getLogger(__name__)
 # Combined CE + Dice loss
 # ---------------------------------------------------------------------------
 
-class _CombinedCEDiceLoss(nn.Module):
+class _FocalDiceLoss(nn.Module):
     """
-    Weighted CrossEntropy + soft Dice loss.
+    Focal Loss + soft Dice loss.
 
-    Dice is computed over defect classes only (skips background=0) so the
-    loss directly optimises the per-class IoU / Dice metrics we report.
-    ce_weight + dice_weight should sum to 1.0.
+    Focal Loss (gamma=2) down-weights easy background pixels and forces the
+    model to focus on hard, rare defect regions — directly fixes the low
+    precision on crack and moisture.
+
+    Dice is computed over defect classes 1-4 only (background skipped) to
+    directly optimise the IoU/Dice metrics we report.
+
+    focal_weight + dice_weight should sum to 1.0.
     """
 
     def __init__(
         self,
         class_weights: torch.Tensor,
         num_classes: int,
-        ce_weight: float = 0.5,
-        dice_weight: float = 0.5,
+        focal_weight: float = 0.4,
+        dice_weight: float = 0.6,
+        gamma: float = 2.0,
         smooth: float = 1.0,
     ):
         super().__init__()
-        self.ce        = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1)
-        self.ce_w      = ce_weight
-        self.dice_w    = dice_weight
-        self.smooth    = smooth
+        self.ce          = nn.CrossEntropyLoss(
+            weight=class_weights, ignore_index=-1, reduction="none"
+        )
+        self.focal_w     = focal_weight
+        self.dice_w      = dice_weight
+        self.gamma       = gamma
+        self.smooth      = smooth
         self.num_classes = num_classes
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce_loss = self.ce(logits, targets)
+        # ── Focal loss ────────────────────────────────────────────────────────
+        ce_pixel  = self.ce(logits, targets)           # [B, H, W]
+        pt        = torch.exp(-ce_pixel)               # probability of correct class
+        focal     = ((1 - pt) ** self.gamma) * ce_pixel
+        valid_px  = targets >= 0
+        focal_loss = focal[valid_px].mean()
 
-        probs = torch.softmax(logits, dim=1)          # [B, C, H, W]
-        valid = (targets >= 0) & (targets < self.num_classes)
-
+        # ── Soft Dice over defect classes only ────────────────────────────────
+        probs    = torch.softmax(logits, dim=1)
+        valid    = (targets >= 0) & (targets < self.num_classes)
         dice_sum = torch.tensor(0.0, device=logits.device)
-        n_defect = self.num_classes - 1               # skip background
         for c in range(1, self.num_classes):
             p = probs[:, c][valid]
             t = (targets[valid] == c).float()
@@ -69,7 +82,7 @@ class _CombinedCEDiceLoss(nn.Module):
                     / (p.sum() + t.sum() + self.smooth)
             )
 
-        return self.ce_w * ce_loss + self.dice_w * (dice_sum / n_defect)
+        return self.focal_w * focal_loss + self.dice_w * (dice_sum / (self.num_classes - 1))
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +120,18 @@ def _compute_class_weights(annotation_file: str, num_classes: int) -> list[float
     weights = np.clip(weights, 0.1, 10.0)
     weights /= weights.mean()                         # normalise mean → 1
 
+    # Background (class 0) is already suppressed by Focal Loss (gamma=2).
+    # Double-suppressing it via a tiny class weight causes over-prediction of
+    # defects early in training and collapses pixel accuracy.
+    # Floor it at 0.5 so the model still respects background boundaries.
+    weights[0] = max(weights[0], 0.5)
+
+    # Moisture (class 4) is chronically under-predicted — give it an extra boost
+    # on top of whatever inverse-frequency already computed
+    weights[4] = min(weights[4] * 1.8, 10.0)
+
     logger.info(
-        "Class weights (data-driven): %s",
+        "Class weights (data-driven, moisture-boosted): %s",
         {i: f"{w:.3f}" for i, w in enumerate(weights)},
     )
     return weights.tolist()
@@ -205,7 +228,7 @@ class EarlyFusionSegmentationModelV2(nn.Module):
         if class_weights is None:
             class_weights = [0.2, 3.0, 2.0, 1.0, 3.0]
         weights = torch.tensor(class_weights[:num_classes], dtype=torch.float32)
-        self.criterion = _CombinedCEDiceLoss(weights, num_classes)
+        self.criterion = _FocalDiceLoss(weights, num_classes)
 
     def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.backbone.forward_features(x)
@@ -437,37 +460,63 @@ class EarlyFusionPipelineV2:
         history    = {"train": [], "val": []}
         no_improve = 0
 
-        for epoch in range(self.num_epochs):
-            logger.info("── Epoch %d/%d ──", epoch + 1, self.num_epochs)
+        try:
+            for epoch in range(self.num_epochs):
+                logger.info("── Epoch %d/%d ──", epoch + 1, self.num_epochs)
 
-            train_m = self.trainer.train_epoch(train_loader, self.num_classes)
-            val_m   = self.trainer.validate(val_loader, self.num_classes)
+                train_m = self.trainer.train_epoch(train_loader, self.num_classes)
+                val_m   = self.trainer.validate(val_loader, self.num_classes)
 
-            logger.info("Train: %s", {k: f"{v:.4f}" for k, v in train_m.items()
-                                       if not isinstance(v, list)})
-            logger.info("Val:   %s", {k: f"{v:.4f}" for k, v in val_m.items()
-                                       if not isinstance(v, list)})
+                logger.info("Train: %s", {k: f"{v:.4f}" for k, v in train_m.items()
+                                           if not isinstance(v, list)})
+                logger.info("Val:   %s", {k: f"{v:.4f}" for k, v in val_m.items()
+                                           if not isinstance(v, list)})
 
-            history["train"].append(train_m)
-            history["val"].append(val_m)
+                history["train"].append(train_m)
+                history["val"].append(val_m)
 
-            score = val_m.get("mean_iou", 0.0)
-            self.trainer.scheduler.step()   # cosine/sequential — no arg needed
+                score = val_m.get("mean_iou", 0.0)
+                self.trainer.scheduler.step()   # cosine/sequential — no arg needed
 
-            if score > self.trainer.best_metric:
-                self.trainer.best_metric = score
-                self.trainer.best_epoch  = epoch
-                no_improve = 0
-                ckpt = self.checkpoint_dir / f"best_early_fusion_v2_epoch{epoch:03d}.pth"
-                self.trainer.save_checkpoint(str(ckpt), epoch, val_m)
-            else:
-                no_improve += 1
-                if no_improve >= early_stop_patience:
-                    logger.info("Early stopping at epoch %d", epoch + 1)
-                    break
+                if score > self.trainer.best_metric:
+                    self.trainer.best_metric = score
+                    self.trainer.best_epoch  = epoch
+                    no_improve = 0
+                    ckpt = self.checkpoint_dir / f"best_early_fusion_v2_epoch{epoch:03d}.pth"
+                    self.trainer.save_checkpoint(str(ckpt), epoch, val_m)
+                else:
+                    no_improve += 1
+                    if no_improve >= early_stop_patience:
+                        logger.info("Early stopping at epoch %d", epoch + 1)
+                        break
 
-        best_val_m = history["val"][self.trainer.best_epoch]
-        _log_final_metrics(best_val_m, f"Best Val Metrics  (epoch {self.trainer.best_epoch + 1})")
+        except KeyboardInterrupt:
+            logger.info("\n[INTERRUPTED] Ctrl+C received — stopping training early.")
+
+        # ── Report best results regardless of how training ended ────────────
+        if not history["val"]:
+            logger.warning("No epochs completed — nothing to report.")
+            return history
+
+        best_epoch = self.trainer.best_epoch if self.trainer.best_metric > 0.0 else 0
+
+        # Try to reload the best checkpoint so metrics reflect the saved model
+        best_ckpt = self.checkpoint_dir / f"best_early_fusion_v2_epoch{best_epoch:03d}.pth"
+        if best_ckpt.exists():
+            logger.info("Loading best checkpoint: %s", best_ckpt)
+            self.trainer.load_checkpoint(str(best_ckpt))
+        else:
+            logger.info("Best checkpoint not found on disk — reporting in-memory metrics.")
+
+        best_val_m = history["val"][best_epoch]
+        _log_final_metrics(best_val_m, f"Best Val Metrics  (epoch {best_epoch + 1})")
+
+        import json
+        history_path = self.checkpoint_dir / "training_history.json"
+        with open(history_path, "w") as f:
+            json.dump(history, f, indent=2)
+        logger.info("Training history saved: %s", history_path)
+
         return history
 
     def predict(self, fused_path: str, checkpoint_path: Optional[str] = None) -> dict:

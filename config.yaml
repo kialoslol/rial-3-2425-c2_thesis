@@ -3,7 +3,7 @@
 # ── Dataset ──────────────────────────────────────────────────────────────────
 dataset:
   # CVAT XML source annotations (used to regenerate COCO JSON if annotations are empty)
-  xml_annotation: "ANNOTATED_DATA/merged_annotations_Amazing.xml"
+  xml_annotation: "ANNOTATED_DATA/final_unified_dataset.xml"
 
   # Directory that contains the COCO JSON files
   annotation_dir: "dataset"
@@ -16,7 +16,7 @@ dataset:
   # Used by the Early Fusion model; image file_names in COCO JSON are relative to this directory.
   fused_dir: "ANNOTATED_DATA"
 
-  image_size:  256
+  image_size:  384
   num_classes: 5           # 0=background 1=crack 2=spall 3=delamination 4=moisture
   num_workers: 4
   train_ratio: 0.8         # fraction of images used for training
@@ -42,16 +42,16 @@ model:
 
 # ── Training ─────────────────────────────────────────────────────────────────
 training:
-  batch_size:               8      # Early Fusion single-backbone; reduce to 4 if OOM
+  batch_size:               6      # 384px on RTX 3050 4GB; drop to 4 if OOM
   num_epochs:               200
   learning_rate:            0.0003
   weight_decay:             0.0001
   optimizer:                "adam"
-  scheduler:                "reduce_on_plateau"
+  scheduler:                "cosine_warmup"
   scheduler_patience:       10
   scheduler_factor:         0.5
   gradient_clip:            1.0
-  early_stopping_patience:  20
+  early_stopping_patience:  30
   val_frequency:            1
 
 # ── Augmentation ─────────────────────────────────────────────────────────────

@@ -38,76 +38,179 @@ class DefectVisualization:
         history: Dict[str, List],
         save_path: str = None
     ):
-        """Plot training and validation metrics over epochs"""
-        
-        metrics = ['loss', 'accuracy', 'iou', 'dice', 'f1_score', 'map']
-        
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        axes = axes.flatten()
-        
-        for idx, metric in enumerate(metrics):
+        """Plot train vs val curves for each metric, one subplot per metric."""
+
+        metric_config = {
+            'loss':      {'label': 'Loss',     'lower_better': True},
+            'accuracy':  {'label': 'Accuracy', 'lower_better': False},
+            'mean_iou':  {'label': 'IoU',      'lower_better': False},
+            'mean_dice': {'label': 'Dice',     'lower_better': False},
+            'macro_f1':  {'label': 'F1 Score', 'lower_better': False},
+            'mAP':       {'label': 'mAP',      'lower_better': False},
+        }
+
+        # Only plot metrics that actually exist in history
+        available = [
+            m for m in metric_config
+            if any(m in h for h in history.get('train', []))
+        ]
+
+        n = len(available)
+        ncols = 3
+        nrows = (n + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows))
+        axes = np.array(axes).flatten()
+
+        for idx, metric in enumerate(available):
             ax = axes[idx]
-            
-            # Extract metric from history
-            train_values = [h.get(metric, 0) for h in history['train']]
-            val_values = [h.get(metric, 0) for h in history['val']]
-            
-            epochs = range(1, len(train_values) + 1)
-            
-            ax.plot(epochs, train_values, 'o-', label='Train', linewidth=2, markersize=4)
-            ax.plot(epochs, val_values, 's-', label='Val', linewidth=2, markersize=4)
+            cfg = metric_config[metric]
+
+            train_vals = [h.get(metric, np.nan) for h in history['train']]
+            val_vals   = [h.get(metric, np.nan) for h in history['val']]
+            epochs     = list(range(1, len(train_vals) + 1))
+
+            ax.plot(epochs, train_vals, color='#1f77b4', linewidth=2,
+                    marker='o', markersize=4, label='Train')
+            ax.plot(epochs, val_vals,   color='#ff7f0e', linewidth=2,
+                    marker='s', markersize=4, linestyle='--', label='Val')
+
+            # Mark best validation epoch
+            val_arr = np.array(val_vals, dtype=float)
+            if not np.all(np.isnan(val_arr)):
+                best_ep = int(np.nanargmin(val_arr) if cfg['lower_better']
+                              else np.nanargmax(val_arr)) + 1
+                best_val = val_arr[best_ep - 1]
+                ax.axvline(best_ep, color='gray', linestyle=':', linewidth=1, alpha=0.7)
+                ax.annotate(
+                    f'Best: {best_val:.4f}\n(ep {best_ep})',
+                    xy=(best_ep, best_val),
+                    xytext=(8, 8), textcoords='offset points',
+                    fontsize=8, color='#ff7f0e',
+                    arrowprops=dict(arrowstyle='->', color='gray', lw=0.8)
+                )
+
             ax.set_xlabel('Epoch', fontsize=11)
-            ax.set_ylabel(metric.replace('_', ' ').title(), fontsize=11)
-            ax.set_title(f'{metric.replace("_", " ").title()} Over Epochs', fontsize=12, fontweight='bold')
-            ax.legend(loc='best')
+            ax.set_ylabel(cfg['label'], fontsize=11)
+            ax.set_title(f'{cfg["label"]} — Train vs Val', fontsize=12, fontweight='bold')
+            ax.legend(loc='best', fontsize=10)
             ax.grid(True, alpha=0.3)
-        
+            ax.set_xlim(left=1)
+
+        # Hide unused subplots
+        for idx in range(len(available), len(axes)):
+            axes[idx].set_visible(False)
+
+        fig.suptitle('Training & Validation Metrics per Epoch', fontsize=15, fontweight='bold', y=1.01)
         plt.tight_layout()
-        
+
         if save_path is None:
             save_path = str(self.output_dir / 'training_history.png')
-        
+
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"Training history saved to {save_path}")
     
     def plot_confusion_matrix(
         self,
-        confusion_matrix: np.ndarray,
+        cm: np.ndarray,
         class_names: List[str] = None,
         save_path: str = None
     ):
-        """Plot confusion matrix heatmap"""
-        
+        """Confusion matrix heatmap with per-class precision, recall, and F1."""
+
         if class_names is None:
             class_names = ['Background', 'Cracks', 'Spalls', 'Moisture']
-        
-        fig, ax = plt.subplots(figsize=(10, 8))
-        
-        # Normalize confusion matrix
-        cm_normalized = confusion_matrix.astype('float') / confusion_matrix.sum(axis=1)[:, np.newaxis]
-        
-        # Plot heatmap
+
+        n = cm.shape[0]
+
+        # Row-normalize for background colour (recall per row)
+        row_sums = cm.sum(axis=1, keepdims=True).astype(float)
+        row_sums[row_sums == 0] = 1          # avoid division by zero
+        cm_norm = cm.astype(float) / row_sums
+
+        # Build annotation: "count\n(xx.x%)" in each cell
+        annot = np.empty((n, n), dtype=object)
+        for i in range(n):
+            for j in range(n):
+                pct = cm_norm[i, j] * 100
+                annot[i, j] = f"{cm[i, j]}\n({pct:.1f}%)"
+
+        # Per-class metrics
+        tp = np.diag(cm).astype(float)
+        fp = cm.sum(axis=0) - tp
+        fn = cm.sum(axis=1) - tp
+        precision = np.where((tp + fp) > 0, tp / (tp + fp), 0.0)
+        recall    = np.where((tp + fn) > 0, tp / (tp + fn), 0.0)
+        f1        = np.where((precision + recall) > 0,
+                             2 * precision * recall / (precision + recall), 0.0)
+
+        fig, axes = plt.subplots(
+            1, 2,
+            figsize=(14, 6),
+            gridspec_kw={'width_ratios': [3, 1]}
+        )
+
+        # ── Left: heatmap ────────────────────────────────────────────────────
+        ax_cm = axes[0]
         sns.heatmap(
-            cm_normalized,
-            annot=confusion_matrix,
-            fmt='d',
+            cm_norm,
+            annot=annot,
+            fmt='',
             cmap='Blues',
+            vmin=0, vmax=1,
             xticklabels=class_names,
             yticklabels=class_names,
-            cbar_kws={'label': 'Normalized Count'},
-            ax=ax
+            linewidths=0.5,
+            linecolor='white',
+            cbar_kws={'label': 'Row-normalised recall', 'shrink': 0.8},
+            ax=ax_cm,
+            annot_kws={'size': 10}
         )
-        
-        ax.set_xlabel('Predicted Label', fontsize=12, fontweight='bold')
-        ax.set_ylabel('True Label', fontsize=12, fontweight='bold')
-        ax.set_title('Confusion Matrix', fontsize=14, fontweight='bold')
-        
+        ax_cm.set_xlabel('Predicted Label', fontsize=12, fontweight='bold')
+        ax_cm.set_ylabel('True Label',      fontsize=12, fontweight='bold')
+        ax_cm.set_title('Confusion Matrix', fontsize=14, fontweight='bold')
+        ax_cm.tick_params(axis='x', rotation=30)
+        ax_cm.tick_params(axis='y', rotation=0)
+
+        # ── Right: per-class bar chart of Precision / Recall / F1 ───────────
+        ax_bar = axes[1]
+        x      = np.arange(n)
+        width  = 0.25
+        ax_bar.barh(x - width, precision, width, label='Precision', color='#1f77b4')
+        ax_bar.barh(x,         recall,    width, label='Recall',    color='#ff7f0e')
+        ax_bar.barh(x + width, f1,        width, label='F1',        color='#2ca02c')
+
+        ax_bar.set_yticks(x)
+        ax_bar.set_yticklabels(class_names, fontsize=10)
+        ax_bar.set_xlabel('Score', fontsize=11)
+        ax_bar.set_title('Per-class Metrics', fontsize=12, fontweight='bold')
+        ax_bar.set_xlim(0, 1.05)
+        ax_bar.legend(loc='lower right', fontsize=9)
+        ax_bar.grid(axis='x', alpha=0.3)
+
+        # Value labels on bars
+        for bars, vals in [(ax_bar.patches[:n], precision),
+                           (ax_bar.patches[n:2*n], recall),
+                           (ax_bar.patches[2*n:], f1)]:
+            for bar, val in zip(bars, vals):
+                ax_bar.text(
+                    bar.get_width() + 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    f'{val:.3f}', va='center', fontsize=8
+                )
+
+        # Overall accuracy in title area
+        overall_acc = np.diag(cm).sum() / cm.sum()
+        fig.suptitle(
+            f'Confusion Matrix Analysis    (Overall Accuracy: {overall_acc:.2%})',
+            fontsize=14, fontweight='bold', y=1.02
+        )
+
         plt.tight_layout()
-        
+
         if save_path is None:
             save_path = str(self.output_dir / 'confusion_matrix.png')
-        
+
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"Confusion matrix saved to {save_path}")
@@ -306,16 +409,37 @@ class DefectVisualization:
         return colored
 
 
-# Example usage
 if __name__ == "__main__":
-    viz = DefectVisualization()
-    
-    # Example: Plot metrics
-    sample_metrics = {
-        'accuracy': 0.92,
-        'iou': 0.87,
-        'dice': 0.89,
-        'f1_score': 0.88,
-        'map': 0.85
-    }
-    viz.plot_metrics_comparison(sample_metrics)
+    import json, sys
+
+    # ── Load real training history saved by EarlyFusionPipelineV2.train() ───
+    # Default path matches where CNNVIT_v2.py saves it (checkpoint_dir)
+    history_path = sys.argv[1] if len(sys.argv) > 1 else "./checkpoints/training_history.json"
+
+    with open(history_path) as f:
+        history = json.load(f)
+
+    # ── Pull confusion matrix from the best val epoch ───────────────────────
+    # Best epoch = highest mean_iou across all val epochs
+    val_ious  = [h.get("mean_iou", 0.0) for h in history["val"]]
+    best_ep   = int(np.argmax(val_ious))
+    cm_raw    = history["val"][best_ep].get("confusion_matrix")
+
+    if cm_raw is None:
+        print("WARNING: confusion_matrix not found in history — retrain with the updated CNNVIT.py")
+        cm = None
+    else:
+        cm = np.array(cm_raw, dtype=np.int64)
+
+    print(f"Loaded {len(history['train'])} epochs from: {history_path}")
+    print(f"Best val epoch: {best_ep + 1}  (mean_iou = {val_ious[best_ep]:.4f})")
+
+    class_names = ["Background", "Crack", "Spall", "Delamination", "Moisture"]
+    viz = DefectVisualization(output_dir="./visualizations")
+
+    viz.plot_training_history(history)
+
+    if cm is not None:
+        viz.plot_confusion_matrix(cm, class_names=class_names)
+
+    print("Done — check ./visualizations/")
