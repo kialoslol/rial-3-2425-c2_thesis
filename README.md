@@ -4,7 +4,7 @@
 This project implements a **MobileViT V3-based semantic segmentation model** for real-world defect detection (cracks, spalls, moisture) with comprehensive metrics including accuracy, mAP, IoU, F1-score, and Dice coefficient.
 
 ### Architecture
-- **Backbone**: MobileViT S (fusion of CNN + Vision Transformer)
+- **Backbone**: MobileViTv2_100 (fusion of CNN + Vision Transformer)
 - **Task**: Semantic segmentation + Instance detection
 - **Input**: COCO-formatted dataset (supports RGB + Thermal fusion)
 - **Output**: Per-pixel segmentation masks with multi-modal analysis
