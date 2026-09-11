@@ -16,15 +16,47 @@ import streamlit as st
 import torch
 from PIL import Image
 
-# Make sure sibling modules (late_fusion_model, etc.) are importable
+# Make sure the repo root is importable (for the common/ and models/ packages)
 sys.path.insert(0, str(Path(__file__).parent))
 
-from late_fusion_model import LateFusionSegmentationModel, MultiModalDataPreprocessor
-from late_fusion_model_v2 import LateFusionSegmentationModelV2
+import timm
+from models.late_fusion_v1.model import LateFusionSegmentationModel, MultiModalDataPreprocessor
+from models.late_fusion_v2.model import LateFusionSegmentationModelV2
+from models.early_fusion_v2.model import EarlyFusionSegmentationModelV2
+from models.CNN_VIT_SELF.model import CNNViTSelfSegmentationModel
+from models.mobilenet_v4.model import MobileNetV4SegmentationModel
+from common.heads import MobileViTSegmentationHead
+
+
+class _LegacyEarlyFusionV2(torch.nn.Module):
+    """
+    Compatibility shim for early-fusion checkpoints saved before the ASPP
+    decoder was introduced.  Matches the old seg_head=MobileViTSegmentationHead
+    architecture so those checkpoints can still be loaded.
+    """
+    def __init__(self, num_classes: int = 5, hidden_dim: int = 256, in_channels: int = 4):
+        super().__init__()
+        self.channel_proj = torch.nn.Conv2d(in_channels, 3, kernel_size=1, bias=False)
+        self.backbone     = timm.create_model("mobilevitv2_100", pretrained=False)
+        backbone_ch       = getattr(self.backbone, "num_features", 256)
+        self.seg_head     = MobileViTSegmentationHead(backbone_ch, num_classes, hidden_dim)
+
+    def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        feats = self.backbone.forward_features(x)
+        if feats.dim() == 4:
+            return feats
+        if feats.dim() == 3:
+            B, N, C = feats.shape
+            h = w = int(N ** 0.5)
+            return feats.permute(0, 2, 1).reshape(B, C, h, w)
+        raise ValueError(f"Unexpected feature dim: {feats.dim()}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.seg_head(self._extract_features(self.channel_proj(x)))
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-CHECKPOINTS_DIR = Path(__file__).parent / "checkpoints"
+MODELS_DIR = Path(__file__).parent / "models"
 IMAGE_SIZE = 256
 NUM_CLASSES = 5
 
@@ -75,20 +107,44 @@ st.markdown(
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def list_checkpoints() -> list[Path]:
-    if not CHECKPOINTS_DIR.exists():
+    """Every *.pth under models/<name>/checkpoints/, across all model folders."""
+    if not MODELS_DIR.exists():
         return []
-    return sorted(CHECKPOINTS_DIR.glob("*.pth"), key=lambda p: p.name)
+    return sorted(MODELS_DIR.glob("*/checkpoints/*.pth"), key=lambda p: p.name)
+
+
+def checkpoint_label(p: Path) -> str:
+    """'<model_folder>/<filename>' — the model folder disambiguates identical filenames."""
+    return f"{p.parent.parent.name}/{p.name}"
+
+
+def is_cnn_vit_self(name: str) -> bool:
+    return "cnn_vit_self" in name.lower()
+
+
+def is_mobilenet_v4(name: str) -> bool:
+    return "mobilenet_v4" in name.lower()
+
+
+def is_early_fusion(name: str) -> bool:
+    return "early_fusion" in name.lower()
 
 
 def is_v2(name: str) -> bool:
-    return "_v2_" in name.lower()
+    return "_v2_" in name.lower() and not is_early_fusion(name)
 
 
 def detect_hidden_dim(state: dict) -> int:
-    """Read hidden_dim from the first decoder conv weight shape."""
-    key = "decoder.rgb_dec1.0.weight"
-    if key in state:
-        return int(state[key].shape[0])
+    """Read hidden_dim from decoder weight shapes (handles all architectures)."""
+    # Early fusion ASPP decoder
+    if "decoder.project.0.weight" in state:
+        return int(state["decoder.project.0.weight"].shape[0])
+    # Early fusion legacy (MobileViTSegmentationHead)
+    if "seg_head.decoder.0.0.weight" in state:
+        return int(state["seg_head.decoder.0.0.weight"].shape[0])
+    # Late fusion decoder
+    if "decoder.rgb_dec1.0.weight" in state:
+        return int(state["decoder.rgb_dec1.0.weight"].shape[0])
     return 256
 
 
@@ -98,8 +154,37 @@ def load_model(checkpoint_path: str):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state = ckpt["model_state"]
     hidden_dim = detect_hidden_dim(state)
+    name = Path(checkpoint_path).name
 
-    if is_v2(Path(checkpoint_path).name):
+    if is_cnn_vit_self(name):
+        model = CNNViTSelfSegmentationModel(
+            num_classes=NUM_CLASSES,
+            hidden_dim=hidden_dim,
+            in_channels=4,
+        )
+    elif is_mobilenet_v4(name):
+        model = MobileNetV4SegmentationModel(
+            num_classes=NUM_CLASSES,
+            pretrained=False,
+            hidden_dim=hidden_dim,
+            in_channels=4,
+        )
+    elif is_early_fusion(name):
+        if "seg_head.seg_head.weight" in state:
+            # Checkpoint saved before ASPP decoder — use legacy architecture
+            model = _LegacyEarlyFusionV2(
+                num_classes=NUM_CLASSES,
+                hidden_dim=hidden_dim,
+                in_channels=4,
+            )
+        else:
+            model = EarlyFusionSegmentationModelV2(
+                num_classes=NUM_CLASSES,
+                pretrained=False,
+                hidden_dim=hidden_dim,
+                in_channels=4,
+            )
+    elif is_v2(name):
         model = LateFusionSegmentationModelV2(
             num_classes=NUM_CLASSES,
             backbone_name="mobilevitv2_100",
@@ -114,7 +199,9 @@ def load_model(checkpoint_path: str):
             hidden_dim=hidden_dim,
         )
 
-    model.load_state_dict(state)
+    # Strip loss-function weights — not needed for inference
+    state = {k: v for k, v in state.items() if not k.startswith("criterion")}
+    model.load_state_dict(state, strict=False)
     model.eval()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -162,7 +249,14 @@ def run_inference(
     mask  : [H, W] int, predicted class (defects below threshold → 0)
     probs : [C, H, W] float, per-class probability maps
     """
-    logits = model(rgb_t.to(device), irt_t.to(device))   # [1, C, H, W]
+    if hasattr(model, "channel_proj") or isinstance(model, CNNViTSelfSegmentationModel):
+        # Early fusion (or the from-scratch CNN-ViT-Self model, which takes
+        # the 4-channel input directly with no separate projection layer):
+        # concatenate RGB [1,3,H,W] + IRT [1,1,H,W] → [1,4,H,W]
+        fused = torch.cat([rgb_t, irt_t], dim=1).to(device)
+        logits = model(fused)
+    else:
+        logits = model(rgb_t.to(device), irt_t.to(device))   # [1, C, H, W]
     probs = torch.softmax(logits, dim=1).squeeze(0)       # [C, H, W]
     mask  = probs.argmax(dim=0)                           # [H, W]
 
@@ -234,12 +328,12 @@ with st.sidebar:
     # Checkpoint selection
     checkpoints = list_checkpoints()
     if not checkpoints:
-        st.error(f"No .pth files found in `{CHECKPOINTS_DIR}`")
+        st.error(f"No .pth files found under `{MODELS_DIR}/*/checkpoints/`")
         st.stop()
 
-    ckpt_names = [p.name for p in checkpoints]
-    selected_name = st.selectbox("Checkpoint", ckpt_names, index=len(ckpt_names) - 1)
-    selected_path = str(CHECKPOINTS_DIR / selected_name)
+    ckpt_labels = [checkpoint_label(p) for p in checkpoints]
+    selected_label = st.selectbox("Checkpoint", ckpt_labels, index=len(ckpt_labels) - 1)
+    selected_path = str(checkpoints[ckpt_labels.index(selected_label)])
 
     # Show quick metadata without loading full model
     try:

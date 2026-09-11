@@ -1,5 +1,14 @@
 # Dataset Format & Augmentation Guide
 
+> **Note:** this guide documents the original Pascal-VOC-XML + manual-paths
+> workflow (`common.dataset_utils.XMLToCOCOConverter`, `DatasetOrganizer`).
+> The dataset actually in use now (`ANNOTATED_DATA/`, `RGB_FITTED/`,
+> `IRT_FITTED/`) is annotated in **CVAT 1.1 XML** and converted automatically
+> by `common.dataset_utils.CVATXMLToCOCOConverter`, driven by `config.yaml` —
+> see the top-level `README.md` for that flow. Keep this guide as a reference
+> for the underlying COCO/augmentation format, and for onboarding a dataset
+> that only has Pascal VOC XML available.
+
 ## Current Augmentation Strategy
 
 The model now uses **comprehensive data augmentation** to improve robustness:
@@ -103,7 +112,7 @@ Your XML files likely contain **bounding boxes** like:
 
 The converter transforms this to **COCO format**:
 ```python
-from dataset_utils import XMLToCOCOConverter
+from common.dataset_utils import XMLToCOCOConverter
 
 converter = XMLToCOCOConverter(
     image_dir="path/to/rgb_images",
@@ -130,7 +139,7 @@ converter.convert_to_coco(
 If you want to use **thermal information** for better defect detection:
 
 ```python
-from dataset_utils import MultimodalImageFusion
+from common.dataset_utils import MultimodalImageFusion
 
 MultimodalImageFusion.create_4channel_dataset(
     rgb_dir="path/to/fitthermal_images/rgb",      # Your RGB images
@@ -146,7 +155,7 @@ MultimodalImageFusion.create_4channel_dataset(
 ### **Step 3: Organize into Train/Val/Test**
 
 ```python
-from dataset_utils import DatasetOrganizer
+from common.dataset_utils import DatasetOrganizer
 
 DatasetOrganizer.organize_dataset(
     source_dir="path/to/all/rgb_images",
@@ -224,7 +233,7 @@ Your XML bounding boxes need to be converted to COCO **segmentation mask** forma
 2. **Convert XML → COCO JSON**
    ```python
    python -c "
-   from dataset_utils import XMLToCOCOConverter
+   from common.dataset_utils import XMLToCOCOConverter
    converter = XMLToCOCOConverter('path/to/rgb', 'path/to/xml')
    converter.register_categories({'cracks': 1, 'spalls': 2, 'moisture': 3})
    converter.convert_to_coco('instances_train.json')
@@ -234,7 +243,7 @@ Your XML bounding boxes need to be converted to COCO **segmentation mask** forma
 3. **Optionally create 4-channel RGBT images**
    ```python
    python -c "
-   from dataset_utils import MultimodalImageFusion
+   from common.dataset_utils import MultimodalImageFusion
    MultimodalImageFusion.create_4channel_dataset(
        'path/to/rgb', 
        'path/to/thermal', 
@@ -246,7 +255,7 @@ Your XML bounding boxes need to be converted to COCO **segmentation mask** forma
 4. **Organize into train/val/test**
    ```python
    python -c "
-   from dataset_utils import DatasetOrganizer
+   from common.dataset_utils import DatasetOrganizer
    DatasetOrganizer.organize_dataset('path/to/images', 'dataset')
    "
    ```
@@ -261,7 +270,7 @@ Your XML bounding boxes need to be converted to COCO **segmentation mask** forma
 
 6. **Run training**
    ```bash
-   python CNNVIT.py
+   python models/early_fusion_v2/train.py
    ```
 
 ---
@@ -316,7 +325,7 @@ Before training, ensure you have:
 """Convert your dataset from raw files to COCO format"""
 
 from pathlib import Path
-from dataset_utils import XMLToCOCOConverter, MultimodalImageFusion
+from common.dataset_utils import XMLToCOCOConverter, MultimodalImageFusion
 
 # Paths (update these!)
 IMAGE_DIR = r"C:\Users\David\Documents\DLSU\THESIS\images\rgb"
@@ -337,7 +346,7 @@ MultimodalImageFusion.create_4channel_dataset(IMAGE_DIR, THERMAL_DIR, f"{OUTPUT_
 print("✓ Done!")
 
 print(f"\n✓ Dataset prepared in {OUTPUT_DIR}/")
-print("  Now update config.yaml and run: python CNNVIT.py")
+print("  Now update config.yaml and run: python models/early_fusion_v2/train.py")
 ```
 
 ---

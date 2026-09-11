@@ -3,7 +3,7 @@
 # ── Dataset ──────────────────────────────────────────────────────────────────
 dataset:
   # CVAT XML source annotations (used to regenerate COCO JSON if annotations are empty)
-  xml_annotation: "ANNOTATED_DATA/final_unified_dataset.xml"
+  xml_annotation: "ANNOTATED_DATA/fifthmerged_output.xml"
 
   # Directory that contains the COCO JSON files
   annotation_dir: "dataset"
@@ -13,8 +13,13 @@ dataset:
   val_annotation_file:   "dataset/instances_val.json"
 
   # Root directory for fused TIFF images (contains subfolders: fuse_Binondo, FUSED, Pasay-LP, Binondocropped)
-  # Used by the Early Fusion model; image file_names in COCO JSON are relative to this directory.
+  # Used by the Early Fusion and single-modal models; image file_names in COCO JSON are relative to this directory.
   fused_dir: "ANNOTATED_DATA"
+
+  # Separate RGB / IRT image directories, matched by file stem.
+  # Used by the Late Fusion models (models/late_fusion_v1, models/late_fusion_v2).
+  rgb_dir: "RGB_FITTED"
+  irt_dir: "IRT_FITTED"
 
   image_size:  384
   num_classes: 5           # 0=background 1=crack 2=spall 3=delamination 4=moisture
@@ -43,7 +48,7 @@ model:
 # ── Training ─────────────────────────────────────────────────────────────────
 training:
   batch_size:               6      # 384px on RTX 3050 4GB; drop to 4 if OOM
-  num_epochs:               200
+  num_epochs:               300
   learning_rate:            0.0003
   weight_decay:             0.0001
   optimizer:                "adam"
@@ -51,7 +56,7 @@ training:
   scheduler_patience:       10
   scheduler_factor:         0.5
   gradient_clip:            1.0
-  early_stopping_patience:  30
+  early_stopping_patience:  60
   val_frequency:            1
 
 # ── Augmentation ─────────────────────────────────────────────────────────────
@@ -80,12 +85,18 @@ augmentation:
 
 # ── Checkpoints ──────────────────────────────────────────────────────────────
 checkpoint:
+  # Each models/<name>/train.py ignores this and saves to its own
+  # models/<name>/checkpoints/ folder instead, so multiple models never
+  # collide. This value is only a fallback for scripts that don't override it.
   save_dir:       "./checkpoints"
-  keep_best_n:    3
+  # Only the top `keep_best_n` checkpoints (by validation score) are kept on disk.
+  # Whenever a new checkpoint is saved and this limit is exceeded, the
+  # lowest-scoring .pth file is deleted automatically.
+  keep_best_n:    10
 
 # ── Inference ────────────────────────────────────────────────────────────────
 inference:
-  checkpoint_path: "./checkpoints/best_late_fusion_epoch000.pth"
+  checkpoint_path: "./models/early_fusion_v2/checkpoints/best_early_fusion_v2_epoch126.pth"
   output_dir:      "./predictions"
 
 # ── Logging ──────────────────────────────────────────────────────────────────

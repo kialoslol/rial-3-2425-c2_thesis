@@ -4,74 +4,68 @@
 
 ```
 THESIS/
-├── CNNVIT.py                   # Main model, trainer, and pipeline
-├── dataset.py                  # Dataset loaders (COCOSegmentationDataset)
-├── dataset_utils.py            # Dataset converters & formatters
-│                               # - XMLToCOCOConverter
-│                               # - MultimodalImageFusion
-│                               # - DatasetOrganizer
-├── visualization.py            # Visualization & plotting utilities
-├── config.yaml                 # Training configuration
-├── requirements.txt            # Python dependencies
-├── quickstart.py               # Automated pipeline script
-├── __init__.py                 # Package initialization
+├── common/                     # Shared infrastructure used by every model
+│   ├── heads.py                #   MobileViTSegmentationHead (bilinear decoder head)
+│   ├── trainer.py              #   DefectDetectionTrainer, DefectDetectionMetrics, checkpoint helpers
+│   ├── losses.py                #   FocalDiceLoss (shared by early_fusion_v2, CNN_VIT_SELF, mobilenet_v4)
+│   ├── dataset.py               #   COCOSegmentationDataset, MultiModalDataset
+│   ├── dataset_utils.py        #   CVAT/Pascal-VOC XML -> COCO JSON converters, class-weight helpers
+│   └── visualization.py        #   Training curve / confusion matrix plotting
 │
-├── README.md                   # Full documentation
-├── DATASET_FORMAT_GUIDE.md    # Dataset format specifications
-├── SETUP.md                    # This file
+├── models/                     # One folder per model/variation — see each README.md
+│   ├── single_modal_v1/        #   MobileViT-S, single 3-channel image
+│   ├── single_modal_v2/        #   MobileViTv2-100, single 3-channel image
+│   ├── early_fusion_v1/        #   MobileViT-S, 4-channel RGBT projected to 3ch
+│   ├── early_fusion_v2/        #   MobileViTv2-100 + ASPP decoder + Focal/Dice loss (primary model)
+│   ├── CNN_VIT_SELF/            #   From-scratch CNN + self-attention hybrid (no pretrained backbone)
+│   ├── mobilenet_v4/            #   MobileNetV4-Conv-Medium backbone
+│   ├── late_fusion_v1/         #   Dual MobileViT-S backbones (RGB + IRT), decoder-level attention fusion
+│   ├── late_fusion_v2/         #   Dual MobileViTv2-100 backbones, decoder-level attention fusion
+│   ├── yolov11_defect_detection/ #  YOLOv11 single-class object detector (bounding boxes, not segmentation)
+│   ├── fastvit_sa12/           #   FastViT-SA12 (trains unfused, reparameterize() on export only)
+│   ├── efficientformerv2_s2/   #   EfficientFormerV2-S2 (native 224px — resolution exception, see its README)
+│   ├── edgenext_small/         #   EdgeNeXt-Small
+│   ├── swiftformer_l1/         #   SwiftFormer-L1
+│   ├── repvit_m1_1/            #   RepViT-M1.1 (trains unfused, reparameterize() on export only)
+│   ├── efficientnet_b0/        #   EfficientNet-B0 — pure-CNN baseline
+│   ├── deit_small/             #   DeiT-Small/patch16/224 — pure-ViT baseline (custom 4-stage decoder)
+│   └── <name>/
+│       ├── model.py            #   nn.Module definition
+│       ├── train.py            #   Pipeline class + config-driven __main__
+│       ├── checkpoints/        #   Saved .pth files for this model only
+│       └── README.md           #   Architecture, usage, and status for this model
 │
-├── checkpoints/                # Saved model checkpoints
-├── visualizations/             # Output visualizations
-├── predictions/                # Inference outputs
-└── dataset/                    # COCO formatted dataset
-    ├── train/
-    ├── val/
+├── scripts/                    # Repo-wide utility scripts (not tied to one model)
+│   ├── channelstack.py         #   Fuse RGB + IR into 4-channel TIFFs
+│   ├── prepare_dataset.py      #   Legacy Pascal-VOC dataset preparation
+│   ├── quickstart.py           #   Legacy end-to-end demo (predates CVAT/config.yaml flow)
+│   ├── test_installation.py    #   Verify environment + imports
+│   ├── count_classes.py        #   Count annotation instances per class in a CVAT XML
+│   └── rename_files.py         #   Batch-rename files in a folder
+│
+├── docs/                       # Reference documents (not code)
+│   └── MobileRankings_TIMM.docx  # TIMM mobile-model ranking behind the mobilenet_v4 backbone choice
+│
+├── dashboard.py                 # Streamlit evaluation UI (loads any model's checkpoints)
+├── config.yaml                  # Shared dataset/training hyperparameters (per-model checkpoint dirs override save_dir)
+├── requirements.txt
+│
+├── README.md                    # Full documentation and model overview
+├── DOCUMENTATION.txt            # Deep technical reference (architecture, training pipeline internals)
+├── DATASET_FORMAT_GUIDE.md      # Dataset format specifications
+├── SETUP.md                     # This file
+│
+├── RGB_FITTED/ IRT_FITTED/ FUSED/ ANNOTATED_DATA/  # Shared source imagery (RGB, IR, fused, CVAT XML)
+└── dataset/                     # COCO-formatted dataset (shared across models)
     ├── instances_train.json
     └── instances_val.json
 ```
 
-## File Breakdown
-
-### Core Model Files
-
-#### `CNNVIT.py` - Main Model & Training
-- **Classes**:
-  - `MobileViTSegmentationHead`: Decoder head for segmentation
-  - `MobileViTSegmentationModel`: Full MobileViT model
-  - `DefectDetectionMetrics`: Metric computation (Accuracy, IoU, Dice, F1, mAP)
-  - `DefectDetectionTrainer`: Training & validation loop
-  - `DefectDetectionPipeline`: Complete training + inference pipeline
-
-#### `dataset.py` - Dataset Loading (NEW)
-- **Classes**:
-  - `RandomGaussianNoise`: Data augmentation
-  - `COCOSegmentationDataset`: COCO dataset loader with comprehensive augmentation
-  
-- **Features**:
-  - Loads COCO JSON annotations
-  - Generates segmentation masks
-  - Multi-level augmentation (geometric, color, noise)
-  - Handles JPEG, PNG, TIFF formats
-
-#### `dataset_utils.py` - Dataset Formatting
-- **Classes**:
-  - `XMLToCOCOConverter`: Converts Pascal VOC XML to COCO JSON format
-  - `MultimodalImageFusion`: Fuses RGB + Thermal images into 4-channel RGBT
-  - `DatasetOrganizer`: Organizes dataset into train/val/test splits
-
-#### `visualization.py` - Results Visualization
-- **Classes**:
-  - `DefectVisualization`: Plotting & visualization tools
-    - Training history plots
-    - Confusion matrix
-    - Segmentation results
-    - Defect distribution
-
-### Configuration & Utilities
-
-- **config.yaml**: All training hyperparameters
-- **requirements.txt**: Python dependencies
-- **quickstart.py**: Automated end-to-end pipeline
+Each model folder is self-contained for training/inference purposes (its own
+`model.py`, `train.py`, `checkpoints/`), while importing shared, non-model-specific
+code from `common/`. This means a bug fix to the trainer or dataset loader in
+`common/` applies to every model at once, but each model's checkpoints never
+collide with another's.
 
 ## Installation
 
@@ -94,149 +88,42 @@ conda activate defect_detection
 
 ### 3. Install Dependencies
 ```bash
-# Install all requirements
 pip install -r requirements.txt
-
-# OR install individually
-pip install torch torchvision timm pycocotools opencv-python pyyaml matplotlib
 ```
 
 ### 4. Verify Installation
 ```bash
-python -c "import torch; import timm; print('✓ Installation successful')"
+python scripts/test_installation.py
 ```
+
+This checks package imports, GPU availability, `config.yaml`, dataset
+directories, and a model instantiation + forward pass.
 
 ## Quick Start
 
-### Option 1: Using Automated Pipeline
+Every model can be trained directly from the repo root — each `train.py`
+resolves `config.yaml` and its own `checkpoints/` folder relative to its own
+file location, so the current working directory doesn't matter:
+
 ```bash
-python quickstart.py
+python models/early_fusion_v2/train.py     # primary model — see README.md
+python models/late_fusion_v1/train.py
+python models/single_modal_v1/train.py
+# ...one train.py per model folder under models/
 ```
 
-### Option 2: Manual Steps
+See the top-level `README.md` for a full model comparison table, and each
+`models/<name>/README.md` for that model's architecture and any known
+limitations.
 
-#### Step 1: Prepare Dataset
-Convert your XML annotations to COCO format:
-```python
-from dataset_utils import XMLToCOCOConverter
+### Running the dashboard
 
-converter = XMLToCOCOConverter(
-    image_dir="path/to/images",
-    annotation_dir="path/to/xml"
-)
-converter.register_categories({
-    'cracks': 1,
-    'spalls': 2,
-    'moisture': 3
-})
-converter.convert_to_coco("instances_train.json")
+```bash
+streamlit run dashboard.py
 ```
 
-#### Step 2: Optionally Fuse RGB + Thermal
-```python
-from dataset_utils import MultimodalImageFusion
-
-MultimodalImageFusion.create_4channel_dataset(
-    rgb_dir="path/to/rgb",
-    thermal_dir="path/to/thermal",
-    output_dir="dataset/4channel"
-)
-```
-
-#### Step 3: Update config.yaml
-```yaml
-dataset:
-  root_dir: "path/to/your/dataset"
-  train_annotation_file: "instances_train.json"
-  val_annotation_file: "instances_val.json"
-  num_classes: 4
-```
-
-#### Step 4: Train Model
-```python
-from CNNVIT import DefectDetectionPipeline
-
-pipeline = DefectDetectionPipeline(
-    dataset_root="dataset",
-    num_classes=4,
-    batch_size=8,
-    num_epochs=100
-)
-
-history = pipeline.train()
-```
-
-#### Step 5: Visualize Results
-```python
-from visualization import DefectVisualization
-
-viz = DefectVisualization()
-viz.plot_training_history(history)
-```
-
-#### Step 6: Run Inference
-```python
-prediction = pipeline.predict(
-    "path/to/test/image.jpg",
-    checkpoint_path="checkpoints/best_model_epoch_0.pth"
-)
-```
-
-## Usage Examples
-
-### Example 1: Complete Training Pipeline
-```python
-import yaml
-from CNNVIT import DefectDetectionPipeline
-from visualization import DefectVisualization
-
-# Load config
-with open('config.yaml') as f:
-    config = yaml.safe_load(f)
-
-# Train
-pipeline = DefectDetectionPipeline(
-    dataset_root=config['dataset']['root_dir'],
-    num_classes=config['dataset']['num_classes'],
-    batch_size=config['training']['batch_size'],
-    num_epochs=config['training']['num_epochs']
-)
-
-history = pipeline.train(
-    train_annotation_file=config['dataset']['train_annotation_file'],
-    val_annotation_file=config['dataset']['val_annotation_file']
-)
-
-# Visualize
-viz = DefectVisualization()
-viz.plot_training_history(history)
-```
-
-### Example 2: Single Image Inference
-```python
-from CNNVIT import DefectDetectionPipeline
-
-pipeline = DefectDetectionPipeline(
-    dataset_root="dataset",
-    num_classes=4
-)
-
-result = pipeline.predict(
-    image_path="test_image.jpg",
-    checkpoint_path="checkpoints/best_model_epoch_0.pth"
-)
-
-print(f"Predicted mask shape: {result['mask'].shape}")
-```
-
-### Example 3: Batch Inference
-```python
-results = pipeline.batch_predict(
-    image_dir="test_images",
-    checkpoint_path="checkpoints/best_model_epoch_0.pth",
-    output_dir="predictions"
-)
-```
+The dashboard scans `models/*/checkpoints/*.pth` and picks the right
+architecture automatically from the checkpoint filename prefix.
 
 ## GPU Acceleration
 
@@ -247,52 +134,51 @@ print(f"GPU Available: {torch.cuda.is_available()}")
 print(f"GPU Name: {torch.cuda.get_device_name(0)}")
 ```
 
-### Enable GPU
-The model automatically uses GPU if available. To force CPU:
+### Force CPU
 ```python
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Disable GPU
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
 ```
 
 ## Troubleshooting
 
-### Issue: Module not found error
-```
-ModuleNotFoundError: No module named 'dataset'
-```
-**Fix**: Ensure `dataset.py` is in the same directory as `CNNVIT.py`
+### Issue: `ModuleNotFoundError: No module named 'common'` or `'models'`
+**Fix**: Run scripts from the repo root (`python models/<name>/train.py`,
+not `cd models/<name> && python train.py`). Every entry-point script inserts
+the repo root onto `sys.path` itself, so this is the only requirement.
+
+### Issue: SSL error / `LocalEntryNotFoundError` when downloading pretrained weights
+**Fix**: Some networks (university/corporate proxies, some antivirus
+software) TLS-intercept HTTPS with their own certificate — Windows and
+`curl` trust it, but Python's `certifi` bundle doesn't, so `timm`'s Hugging
+Face Hub download fails with an SSL certificate error. `common/__init__.py`
+already calls `truststore.inject_into_ssl()` to point Python's SSL
+verification at the OS trust store instead — just make sure `truststore` is
+installed (it's in `requirements.txt`).
 
 ### Issue: COCO annotation not found
-```
-FileNotFoundError: instances_train.json not found
-```
-**Fix**: Generate COCO JSON using `XMLToCOCOConverter` first
+**Fix**: Each `models/<name>/train.py` regenerates
+`dataset/instances_train.json` / `instances_val.json` from
+`ANNOTATED_DATA/*.xml` automatically on first run via
+`common.dataset_utils.CVATXMLToCOCOConverter`, driven by `config.yaml`'s
+`dataset.xml_annotation` key.
 
 ### Issue: Out of memory (OOM)
-**Fix**: Reduce `batch_size` in config.yaml or reduce `image_size`
+**Fix**: Reduce `training.batch_size` or `dataset.image_size` in `config.yaml`.
 
 ### Issue: Dataset loading is slow
-**Fix**: 
-- Increase `num_workers` in DataLoader
+**Fix**:
+- Reduce `num_workers` in the `DataLoader` calls inside `train.py` if you hit
+  deadlocks on Windows
 - Use SSD storage if available
-- Pre-process images to smaller sizes
-
-## Performance Tips
-
-1. **Use TIFF images** for best thermal + RGB fusion results
-2. **Enable mixed precision training** (set in config.yaml)
-3. **Use multiple GPUs** with DataParallel
-4. **Increase augmentation** for better generalization
-5. **Use learning rate scheduling** (already enabled)
 
 ## Model Metrics
 
-The model computes and tracks:
-- ✅ **Accuracy**: Pixel-level classification accuracy
-- ✅ **IoU**: Intersection over Union
-- ✅ **Dice**: Dice coefficient
-- ✅ **F1-Score**: Harmonic mean of precision/recall
-- ✅ **mAP**: Mean Average Precision
+`common/trainer.py`'s `DefectDetectionMetrics` computes and tracks:
+- **Accuracy**: Pixel-level classification accuracy
+- **IoU**: Intersection over Union (per-class and mean)
+- **Dice**: Dice coefficient (per-class and mean)
+- **F1-Score / mAP**: Precision/recall-derived metrics over defect classes (background excluded)
 
 ## Citation
 
@@ -308,18 +194,10 @@ If you use this model in your thesis:
 
 ## Support & Debugging
 
-1. Check `config.yaml` for correct paths
-2. Verify COCO JSON format matches specification
+1. Check `config.yaml` for correct dataset paths
+2. Verify the COCO JSON format matches `DATASET_FORMAT_GUIDE.md`
 3. Ensure all dependencies are installed: `pip install -r requirements.txt`
-4. Enable debug logging: Set `logging_level: DEBUG` in config
-5. Check `logs/training.log` for detailed error messages
+4. Run `python scripts/test_installation.py` for a full environment check
 
-## Next Steps
-
-1. ✅ Install dependencies
-2. ✅ Prepare dataset (convert XML to COCO)
-3. ✅ Run training (adjust config.yaml as needed)
-4. ✅ Visualize results
-5. ✅ Deploy inference on new images
-
-For detailed dataset format information, see `DATASET_FORMAT_GUIDE.md`
+For detailed dataset format information, see `DATASET_FORMAT_GUIDE.md`.
+For per-model architecture details, see `models/<name>/README.md`.

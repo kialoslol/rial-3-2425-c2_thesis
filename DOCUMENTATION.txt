@@ -1,7 +1,7 @@
 ================================================================================
   CNN-ViT HYBRID MULTIMODAL DEFECT DETECTION SYSTEM
   Technical Documentation (Reference Draft)
-  Date: 2026-04-27
+  Date: 2026-04-27  (updated 2026-09-09 for the models/ + common/ reorganization)
 ================================================================================
 
 TABLE OF CONTENTS
@@ -11,9 +11,12 @@ TABLE OF CONTENTS
   3. Dataset & Annotations
   4. Data Loading & Augmentation
   5. Models
-     5.1 Single-Modal Model (MobileViTSegmentationModel)
-     5.2 Late Fusion Model (LateFusionSegmentationModel)
-     5.3 Modality Attention Gate
+     5.1 Single-Modal Models (v1/v2)
+     5.2 Early Fusion Models (v1/v2)
+     5.3 CNN-ViT-Self (from-scratch hybrid)
+     5.4 MobileNetV4 (early fusion)
+     5.5 Late Fusion Models (v1/v2)
+     5.6 Modality Attention Gate
   6. Training Pipeline
      6.1 Loss Function
      6.2 Optimizer & Scheduler
@@ -39,27 +42,49 @@ on bridge imagery captured via UAV. It targets four defect categories:
   Class 3 – Delamination    (reserved; no annotations yet)
   Class 4 – Moisture        (water ingress / staining)
 
-Two training configurations are supported:
-  - Single-Modal: uses one fused RGB image per sample.
-  - Late Fusion (primary): uses separate RGB and IRT (infrared thermal) images
-    per sample, fused at the decoder stage via learned modality attention.
+Seven segmentation model variants are implemented, each in its own folder
+under models/, sharing training/data infrastructure from common/:
 
-The system is built on PyTorch and uses a MobileViT-S backbone (hybrid CNN-ViT)
-from the `timm` library.
+  - Single-Modal v1/v2   : one 3-channel image per sample, no explicit fusion.
+  - Early Fusion v1/v2   : one 4-channel RGB+IR fused TIFF per sample,
+                            projected to 3 channels via a learnable 1x1 conv
+                            before a single backbone. v2 (the primary model)
+                            adds an ASPP decoder and Focal+Dice loss.
+  - CNN-ViT-Self         : one 4-channel RGB+IR fused TIFF per sample, fed
+                            directly (no channel projection) into a
+                            from-scratch CNN + self-attention hybrid backbone
+                            — the only model here with no pretrained weights.
+  - MobileNetV4          : one 4-channel RGB+IR fused TIFF per sample,
+                            projected to 3 channels (same scheme as Early
+                            Fusion) into a pretrained MobileNetV4-Conv-Medium
+                            backbone. Backbone choice documented in
+                            docs/MobileRankings_TIMM.docx.
+  - Late Fusion v1/v2    : separate RGB and IRT (infrared thermal) images per
+                            sample, fused at the decoder stage via learned
+                            modality attention.
+
+A ninth, separate model (models/yolov11_defect_detection/) performs
+single-class object detection (bounding boxes) with YOLOv11, rather than
+per-pixel segmentation.
+
+v1 variants use a MobileViT-S backbone; v2 variants use MobileViTv2-100 —
+both hybrid CNN-ViT architectures from the `timm` library. The system is
+built on PyTorch. See README.md for the full model comparison table and
+models/<name>/README.md for each model's specifics.
 
 
 ================================================================================
 2. SYSTEM ARCHITECTURE
 ================================================================================
 
-HIGH-LEVEL FLOW (Late Fusion)
-------------------------------
+HIGH-LEVEL FLOW (Late Fusion — models/late_fusion_v1, models/late_fusion_v2)
+------------------------------------------------------------------------------
 
-  RGB Image [B, 3, H, W] ──→ RGB Backbone (MobileViT-S) ──→ RGB Features
+  RGB Image [B, 3, H, W] ──→ RGB Backbone (MobileViT-S/v2) ──→ RGB Features
                                                                           \
                                                                Modality    → Fused → Decoder → Segmentation
                                                                Attention  /           Map
-  IRT Image [B, 1, H, W] ──→ IRT Backbone (MobileViT-S*) ──→ IRT Features
+  IRT Image [B, 1, H, W] ──→ IRT Backbone (MobileViT-S/v2*) ──→ IRT Features
                                                                           /
 
   * IRT backbone first Conv2d adapted: 3-channel → 1-channel input
@@ -74,14 +99,32 @@ The decoder progressively upsamples the fused feature map by 2× at each of
     context is most valuable at coarse scales)
   - Stages 3–5: Single fused pathway (higher resolution, efficiency priority)
 
-SINGLE-MODAL FLOW (MobileViTSegmentationModel)
------------------------------------------------
+EARLY FUSION FLOW (models/early_fusion_v1, models/early_fusion_v2)
+--------------------------------------------------------------------
 
-  Image [B, 3, H, W] ──→ MobileViT-S Backbone ──→ Features [B, 640, H/32, W/32]
+  Fused RGBT [B, 4, H, W] ──→ 1x1 Conv (4ch→3ch) ──→ Backbone (MobileViT-S/v2)
+                                                              │
+                                        Decoder (bilinear head v1 / ASPP head v2)
+                                                              │
+                                          Segmentation Map [B, num_classes, H, W]
+
+  v2's ASPP decoder (atrous spatial pyramid pooling) replaces the plain
+  bilinear-upsample head to recover fine structural detail (crack edges,
+  moisture boundaries) lost in deep backbone features.
+
+SINGLE-MODAL FLOW (models/single_modal_v1, models/single_modal_v2)
+----------------------------------------------------------------------
+
+  Image [B, 3, H, W] ──→ MobileViT-S/v2 Backbone ──→ Features [B, C, H/32, W/32]
                                                               │
                                             5-Stage Decoder (2× upsample each)
                                                               │
                                           Segmentation Map [B, num_classes, H, W]
+
+  NOTE: common/dataset.py's COCOSegmentationDataset always yields a 4-channel
+  [RGB, IR] tensor (IR zero-filled if absent), but this model's backbone
+  expects 3-channel input — see models/single_modal_v1/README.md and
+  models/single_modal_v2/README.md for this known mismatch.
 
 
 ================================================================================
@@ -90,9 +133,9 @@ SINGLE-MODAL FLOW (MobileViTSegmentationModel)
 
 SOURCE ANNOTATIONS
 ------------------
-Raw annotations are stored in CVAT 1.1 XML format (annotations.xml).
-The class CVATXMLToCOCOConverter (dataset_utils.py) converts these into
-COCO-format JSON files at runtime if they are missing or empty.
+Raw annotations are stored in CVAT 1.1 XML format (ANNOTATED_DATA/*.xml).
+The class CVATXMLToCOCOConverter (common/dataset_utils.py) converts these
+into COCO-format JSON files at runtime if they are missing or empty.
 
   - Cracks   → rendered as thick polylines (line width = 10 px), because
                cracks are linear features, not filled regions.
@@ -128,7 +171,7 @@ to compensate (see Section 6.1).
 
 4.1 COCOSegmentationDataset  (single-modal)
 -------------------------------------------
-File: dataset.py
+File: common/dataset.py
 
   - Loads from COCO JSON annotation files.
   - Renders polygon/polyline masks per image on the fly.
@@ -138,7 +181,7 @@ File: dataset.py
 
 4.2 MultiModalDataset  (dual-modal)
 ------------------------------------
-File: dataset.py
+File: common/dataset.py
 
   - Loads paired RGB and IRT images matched by file stem.
   - Returns: dict { "rgb": Tensor[3,H,W], "irt": Tensor[1,H,W],
@@ -168,15 +211,16 @@ preventing label misalignment.
 5. MODELS
 ================================================================================
 
-5.1 MobileViTSegmentationModel  (single-modal)
------------------------------------------------
-File: CNNVIT.py
+5.1 MobileViTSegmentationModel / MobileViTv2SegmentationModel  (single-modal)
+-------------------------------------------------------------------------------
+Files: models/single_modal_v1/model.py (v1), models/single_modal_v2/model.py (v2)
 
-  Backbone:  MobileViT-S  (from timm, pretrained on ImageNet)
-             Fallback: MobileNetV3-small if MobileViT-S is unavailable.
-             Output: feature map [B, 640, H/32, W/32]
+  Backbone:  MobileViT-S (v1) / MobileViTv2-100 (v2), from timm, pretrained on
+             ImageNet. Fallback: mobilenetv3_small_100 (v1) / mobilevitv2_075 (v2)
+             if the primary backbone is unavailable.
+             Output: feature map [B, C, H/32, W/32]
 
-  Head:      MobileViTSegmentationHead
+  Head:      common.heads.MobileViTSegmentationHead
              5-stage decoder; each stage:
                Conv2d(in_ch → hidden_dim) → BN → ReLU → 2× bilinear upsample
              Final: Conv2d(hidden_dim → num_classes), no activation
@@ -187,12 +231,96 @@ File: CNNVIT.py
   Forward signature:
     model(image: Tensor[B,3,H,W]) → logits: Tensor[B,num_classes,H,W]
 
-5.2 LateFusionSegmentationModel  (dual-modal)
-----------------------------------------------
-File: late_fusion_model.py
+  KNOWN ISSUE: the shared common.dataset.COCOSegmentationDataset always
+  returns a 4-channel [RGB, IR] tensor, but this model expects 3-channel
+  input — see models/single_modal_v1/README.md.
 
-  Backbone (RGB): MobileViT-S, 3-channel input, pretrained weights.
-  Backbone (IRT): MobileViT-S, 1-channel input.
+5.2 EarlyFusionSegmentationModel / EarlyFusionSegmentationModelV2
+--------------------------------------------------------------------
+Files: models/early_fusion_v1/model.py (v1), models/early_fusion_v2/model.py (v2)
+
+  Fusion:    Learnable 1x1 Conv2d projects the 4-channel fused RGBT input down
+             to 3 channels (identity-initialised on RGB, zero on IR) before
+             the backbone. Lets the network learn an optimal channel mix
+             from the start of training while keeping pretrained backbone
+             weights intact.
+
+  Backbone:  MobileViT-S (v1) / MobileViTv2-100 (v2), same fallback behaviour
+             as 5.1.
+
+  Decoder:   v1 uses common.heads.MobileViTSegmentationHead (plain bilinear
+             upsampling, same as 5.1). v2 uses models.early_fusion_v2.model.
+             ASPPDecoder (atrous spatial pyramid pooling: parallel dilated
+             convs at rates 1/6/12/18 + global average pooling, concatenated
+             and projected, then 2 progressive upsample+refine steps) to
+             recover fine structural detail lost in deep backbone features.
+
+  Loss:      v1 uses weighted CrossEntropyLoss (same weights as 5.1). v2 uses
+             models.early_fusion_v2.model.FocalDiceLoss — Focal (gamma=3,
+             weight 0.6) + soft Dice over classes 1-4 (weight 0.4), with
+             data-driven class weights (moisture boosted x5) computed by
+             models.early_fusion_v2.train._compute_class_weights.
+
+  Forward signature:
+    model(fused: Tensor[B,4,H,W]) → logits: Tensor[B,num_classes,H,W]
+
+5.3 CNNViTSelfSegmentationModel  (from-scratch CNN + self-attention hybrid)
+------------------------------------------------------------------------------
+File: models/CNN_VIT_SELF/model.py
+
+  The only model in this repo not built on a timm pretrained backbone.
+  Consumes the 4-channel fused RGBT input directly (no channel-projection
+  layer, since there is no pretrained 3-channel stem to protect).
+
+  Stem + stages 1-2: pure CNN (depthwise-separable "inverted residual"
+                      blocks, models.CNN_VIT_SELF.model.CNNStage), each
+                      halving spatial resolution.
+  Stages 3-4:         models.CNN_VIT_SELF.model.CNNViTBlock — local
+                      depthwise-separable conv (handles the 2x downsample)
+                      + one pre-norm Transformer encoder layer (multi-head
+                      self-attention + MLP) over the flattened feature map,
+                      fused back via a 1x1 conv + residual. Attention is
+                      only applied here, once the token grid is small enough
+                      (H/16, H/32) to be cheap — same "local-then-global"
+                      idea MobileViT is built on, reimplemented with plain
+                      nn.MultiheadAttention.
+  Positional encoding: 2D sinusoidal, computed fresh per forward pass from
+                      the actual feature-map size (not a fixed-size learned
+                      table).
+  Decoder:            common.heads.MobileViTSegmentationHead (same shared
+                      decoder as 5.1/5.2's v1 variants).
+  Loss:               common.losses.FocalDiceLoss (same as 5.2's v2).
+
+  Forward signature:
+    model(fused: Tensor[B,4,H,W]) → logits: Tensor[B,num_classes,H,W]
+
+5.4 MobileNetV4SegmentationModel  (early fusion, MobileNetV4 backbone)
+--------------------------------------------------------------------------
+File: models/mobilenet_v4/model.py
+
+  Same early-fusion pattern as 5.2 (learnable 1x1 conv projects the
+  4-channel fused RGBT input down to 3 channels so a pretrained 3-channel
+  backbone can be reused unmodified), with a MobileNetV4-Conv-Medium
+  backbone instead of MobileViT(v2). Backbone selection rationale — TIMM
+  benchmark rankings across 222 mobile ImageNet models — is documented in
+  docs/MobileRankings_TIMM.docx; mobilenetv4_conv_medium (~9.7M params,
+  ~82-83% ImageNet Top-1) was chosen as the mid-size variant, falling back
+  to mobilenetv4_conv_small if unavailable.
+
+  Decoder: common.heads.MobileViTSegmentationHead (same as 5.1/5.2's v1
+           variants).
+  Loss:    common.losses.FocalDiceLoss (same as 5.2's v2 and 5.3).
+
+  Forward signature:
+    model(fused: Tensor[B,4,H,W]) → logits: Tensor[B,num_classes,H,W]
+
+5.5 LateFusionSegmentationModel / LateFusionSegmentationModelV2  (dual-modal)
+--------------------------------------------------------------------------------
+Files: models/late_fusion_v1/model.py (v1), models/late_fusion_v2/model.py (v2)
+
+  Backbone (RGB): MobileViT-S (v1) / MobileViTv2-100 (v2), 3-channel input,
+                  pretrained weights.
+  Backbone (IRT): Same architecture, 1-channel input.
                   Adaptation: first Conv2d weight summed across RGB channel dim,
                   preserving pretrained filter energy.
 
@@ -202,9 +330,13 @@ File: late_fusion_model.py
   Forward signature:
     model(rgb: Tensor[B,3,H,W], irt: Tensor[B,1,H,W]) → logits: Tensor[B,num_classes,H,W]
 
-5.3 ModalityAttention  (inside LateFusionSegmentationModel)
-------------------------------------------------------------
-File: late_fusion_model.py
+  Training pipeline (models/late_fusion_v1/train.py, models/late_fusion_v2/
+  train.py) was added as part of the models/ reorganization — the original
+  codebase shipped only the model definitions with a shape smoke-test.
+
+5.6 ModalityAttention  (inside LateFusionSegmentationModel/V2)
+------------------------------------------------------------------
+Files: models/late_fusion_v1/model.py, models/late_fusion_v2/model.py
 
   Learns per-pixel importance weights for each modality at a given decoder level.
   Output: weighted combination of RGB and IRT features.
@@ -216,14 +348,31 @@ File: late_fusion_model.py
 6. TRAINING PIPELINE
 ================================================================================
 
-Entry class for single-modal:  DefectDetectionPipeline  (CNNVIT.py)
-Entry class for dual-modal:    LateFusionPipeline        (CNNVIT.py)
-Core trainer:                  DefectDetectionTrainer    (CNNVIT.py)
+Core trainer:  DefectDetectionTrainer, DefectDetectionMetrics  (common/trainer.py)
+               Shared by every model below — none of them subclass or
+               reimplement it, they just instantiate it.
+
+Per-model pipeline classes (each is that model's train.py, with a
+config.yaml-driven __main__ block):
+
+  models/single_modal_v1/train.py  : DefectDetectionPipeline
+  models/single_modal_v2/train.py  : DefectDetectionPipelineV2
+  models/early_fusion_v1/train.py  : EarlyFusionPipeline
+  models/early_fusion_v2/train.py  : EarlyFusionPipelineV2
+  models/CNN_VIT_SELF/train.py     : CNNViTSelfPipeline (same training recipe
+                                      as EarlyFusionPipelineV2 — see 5.3)
+  models/mobilenet_v4/train.py     : MobileNetV4Pipeline (same training
+                                      recipe as EarlyFusionPipelineV2 — see 5.4)
+  models/late_fusion_v1/train.py   : LateFusionPipeline   (added during the
+                                      models/ reorganization — see 5.5)
+  models/late_fusion_v2/train.py   : LateFusionPipelineV2 (added during the
+                                      models/ reorganization — see 5.5)
 
 DefectDetectionTrainer auto-detects batch type:
-  - Batch has key "image"       → single-modal forward path
-  - Batch has keys "rgb"/"irt"  → dual-modal forward path
-This allows the same trainer class to be shared between both pipelines.
+  - Batch has key "image"       → single-modal forward path: model(image)
+  - Batch has keys "rgb"/"irt"  → dual-modal forward path:   model(rgb, irt)
+This allows the same trainer class to be shared by every pipeline above,
+whether they're single-modal, early-fusion, or late-fusion.
 
 6.1 Loss Function
 -----------------
@@ -257,10 +406,20 @@ This allows the same trainer class to be shared between both pipelines.
 
 6.4 Checkpointing
 -----------------
-  Saved when validation mean IoU improves.
-  Filename pattern:
-    best_single_modal_epoch{epoch:03d}.pth   (single-modal)
-    best_late_fusion_epoch{epoch:03d}.pth    (late fusion)
+  Saved when validation score improves (mean IoU for most pipelines; early
+  fusion v2 uses a partial mIoU that excludes moisture — see 5.2/6.5). Each
+  model saves into its own models/<name>/checkpoints/ folder; only the top
+  `keep_best_n` checkpoints by score are kept, older ones are pruned
+  automatically (common.trainer.save_and_prune_checkpoint).
+  Filename pattern (per model, in its own checkpoints/ folder):
+    best_single_modal_epoch{epoch:03d}.pth      (models/single_modal_v1)
+    best_single_modal_v2_epoch{epoch:03d}.pth   (models/single_modal_v2)
+    best_early_fusion_epoch{epoch:03d}.pth      (models/early_fusion_v1)
+    best_early_fusion_v2_epoch{epoch:03d}.pth   (models/early_fusion_v2)
+    best_cnn_vit_self_epoch{epoch:03d}.pth      (models/CNN_VIT_SELF)
+    best_mobilenet_v4_epoch{epoch:03d}.pth      (models/mobilenet_v4)
+    best_late_fusion_epoch{epoch:03d}.pth       (models/late_fusion_v1)
+    best_late_fusion_v2_epoch{epoch:03d}.pth    (models/late_fusion_v2)
 
   Checkpoint contents:
     {
@@ -282,7 +441,7 @@ This allows the same trainer class to be shared between both pipelines.
 7. EVALUATION METRICS
 ================================================================================
 
-Class: DefectDetectionMetrics  (CNNVIT.py)
+Class: DefectDetectionMetrics  (common/trainer.py)
 
 Implemented via confusion matrix accumulation (per-pixel predictions vs GT).
 
@@ -361,46 +520,104 @@ device:
 9. FILE / MODULE REFERENCE
 ================================================================================
 
-  CNNVIT.py            — Core module. Contains:
-                           MobileViTSegmentationHead
-                           MobileViTSegmentationModel
-                           DefectDetectionMetrics
-                           DefectDetectionTrainer
-                           DefectDetectionPipeline  (single-modal)
-                           LateFusionPipeline        (dual-modal)
-                           main() entry point
+  common/                       — Shared infrastructure, imported by every model:
+    heads.py                      MobileViTSegmentationHead (shared decoder head)
+    trainer.py                    DefectDetectionMetrics, DefectDetectionTrainer,
+                                   save_and_prune_checkpoint, log_final_metrics
+    losses.py                     FocalDiceLoss (shared by early_fusion_v2,
+                                   CNN_VIT_SELF, and mobilenet_v4)
+    dataset.py                    COCOSegmentationDataset (single-image/fused),
+                                   MultiModalDataset (separate RGB+IRT)
+    dataset_utils.py               CVATXMLToCOCOConverter (primary),
+                                   XMLToCOCOConverter (legacy Pascal VOC),
+                                   MultimodalImageFusion, DatasetOrganizer,
+                                   compute_class_weights, build_moisture_sampler
+    visualization.py               DefectVisualization — training curves, confusion
+                                   matrix, segmentation overlays
 
-  late_fusion_model.py — Dual-backbone model. Contains:
-                           ModalityAttention
-                           LateFusionDecoder
-                           LateFusionSegmentationModel
+  models/                       — One folder per model/variation. Each has:
+    <name>/model.py                nn.Module definition(s) + a shape smoke-test
+                                   under `if __name__ == "__main__"`.
+    <name>/train.py                Pipeline class (train/predict) + a
+                                   config.yaml-driven `if __name__ == "__main__"`.
+    <name>/checkpoints/            That model's .pth checkpoints only.
+    <name>/README.md               Architecture, usage, status/known issues.
 
-  dataset.py           — Dataset classes. Contains:
-                           COCOSegmentationDataset   (single-modal)
-                           MultiModalDataset          (dual-modal)
+    single_modal_v1/  model.py: MobileViTSegmentationModel
+                      train.py: DefectDetectionPipeline
+    single_modal_v2/  model.py: MobileViTv2SegmentationModel
+                      train.py: DefectDetectionPipelineV2
+    early_fusion_v1/  model.py: EarlyFusionSegmentationModel
+                      train.py: EarlyFusionPipeline
+    early_fusion_v2/  model.py: EarlyFusionSegmentationModelV2, ASPPDecoder,
+                                 FocalDiceLoss
+                      train.py: EarlyFusionPipelineV2,
+                                 _compute_class_weights, _build_moisture_sampler
+                      visualizations/  training_history.png, confusion_matrix.png
+                                 from the 200-epoch reference run (see its README)
+    CNN_VIT_SELF/     model.py: CNNViTSelfSegmentationModel, CNNStage,
+                                 CNNViTBlock, 2D sinusoidal positional encoding
+                      train.py: CNNViTSelfPipeline
+    mobilenet_v4/     model.py: MobileNetV4SegmentationModel
+                      train.py: MobileNetV4Pipeline
+    late_fusion_v1/   model.py: LateFusionSegmentationModel, ModalityAttention,
+                                 LateFusionDecoder, MultiModalDataPreprocessor
+                      train.py: LateFusionPipeline
+    late_fusion_v2/   model.py: LateFusionSegmentationModelV2 (+ same helper
+                                 classes as v1), MultiModalDataPreprocessor
+                      train.py: LateFusionPipelineV2
+    yolov11_defect_detection/  Separate object-detection model (Ultralytics
+                                 YOLOv11) — see its own README.md.
+    fastvit_sa12/     model.py: FastViTSegmentationModel (trains unfused,
+                                 reparameterize() only in train.py's predict())
+                      train.py: FastViTPipeline
+    efficientformerv2_s2/  model.py: EfficientFormerV2SegmentationModel
+                      train.py: EfficientFormerV2Pipeline (native 224px —
+                                 resolution exception, see its README)
+    edgenext_small/   model.py: EdgeNeXtSegmentationModel
+                      train.py: EdgeNeXtPipeline
+    swiftformer_l1/   model.py: SwiftFormerSegmentationModel
+                      train.py: SwiftFormerPipeline
+    repvit_m1_1/      model.py: RepViTSegmentationModel (trains unfused,
+                                 reparameterize() only in train.py's predict())
+                      train.py: RepViTPipeline
+    efficientnet_b0/  model.py: EfficientNetB0SegmentationModel (pure-CNN baseline)
+                      train.py: EfficientNetB0Pipeline
+    deit_small/       model.py: DeiTSegmentationModel, DeiTSegmentationHead
+                                 (pure-ViT baseline; custom 4-stage decoder for
+                                 this backbone's stride-16 feature grid)
+                      train.py: DeiTPipeline
 
-  dataset_utils.py     — Annotation utilities. Contains:
-                           CVATXMLToCOCOConverter
-                           Helper functions for dataset preparation
+  scripts/                      — Repo-wide utility scripts, not tied to one model:
+    channelstack.py                Fuse RGB + IR into 4-channel TIFFs.
+    prepare_dataset.py             Legacy Pascal-VOC dataset preparation.
+    quickstart.py                  Legacy end-to-end demo (predates the CVAT/
+                                   config.yaml flow — see its module docstring).
+    test_installation.py           Environment validation (checks torch, timm,
+                                   common/models imports, GPU, config.yaml).
+    count_classes.py               Count annotation instances per class in a
+                                   CVAT XML file.
+    rename_files.py                Batch-rename files in a folder.
 
-  config.yaml          — Central configuration file.
+  dashboard.py                  — Streamlit dashboard. Scans models/*/checkpoints/
+                                   for .pth files and picks the architecture from
+                                   the checkpoint filename prefix.
 
-  visualization.py     — Visualization utilities for predictions and masks.
+  config.yaml                   — Central configuration file (dataset paths +
+                                   training hyperparameters, shared by every
+                                   model's train.py).
 
-  quickstart.py        — Quick-start / demo script.
+  annotations.xml               — Source CVAT 1.1 annotation file (legacy copy;
+                                   the live source is under ANNOTATED_DATA/).
 
-  prepare_dataset.py   — Dataset preparation script.
-
-  test_installation.py — Environment validation (checks torch, timm, etc.)
-
-  annotations.xml      — Source CVAT 1.1 annotation file.
-
-  RGB_FITTED/          — RGB image directory (69 images, PNG).
-  IRT_FITTED/          — IRT thermal image directory (69 images, JPG).
-  FUSED/               — Pre-fused images for single-modal training.
-  dataset/             — COCO JSON output (instances_train.json, instances_val.json).
-  checkpoints/         — Saved model checkpoints (.pth files).
-  requirements.txt     — Python dependencies.
+  RGB_FITTED/                   — RGB image directory (69 images, PNG).
+  IRT_FITTED/                   — IRT thermal image directory (69 images, JPG).
+  FUSED/                        — Pre-fused images for single-modal training.
+  ANNOTATED_DATA/                — 4-channel fused TIFFs (per-batch subfolders)
+                                   + the live CVAT XML annotation source.
+  dataset/                      — COCO JSON output (instances_train.json,
+                                   instances_val.json).
+  requirements.txt              — Python dependencies.
 
 
 ================================================================================
@@ -438,11 +655,13 @@ device:
    and segmentation mask. Applying transforms independently would cause
    pixel-level misalignment between modalities and labels.
 
-6. SHARED TRAINER FOR BOTH PIPELINES
-   DefectDetectionTrainer detects the batch type (single vs. multi-modal) via
-   dict keys and dispatches to the appropriate forward path. This avoids code
-   duplication and ensures both pipelines share the same training logic,
-   metric computation, and checkpointing behavior.
+6. ONE SHARED TRAINER FOR EVERY MODEL
+   DefectDetectionTrainer (common/trainer.py) detects the batch type (single
+   vs. multi-modal) via dict keys and dispatches to the appropriate forward
+   path. This avoids code duplication and ensures all six pipelines
+   (single-modal, early-fusion, late-fusion; v1 and v2) share the same
+   training logic, metric computation, and checkpointing behavior — a fix
+   to the trainer applies to every model at once.
 
 7. BACKGROUND DOWNWEIGHTING
    Background pixels are assigned a class weight of 0.2. Without downweighting,
@@ -455,10 +674,23 @@ device:
    regions, or any area the annotator explicitly left unlabeled.
 
 9. ANNOTATION AUTO-REGENERATION
-   The main() entry point checks whether COCO JSON files exist and are non-empty.
-   If not, it automatically triggers CVATXMLToCOCOConverter to (re)generate them.
-   This makes the pipeline self-contained from raw CVAT annotations.
+   Every models/<name>/train.py's __main__ block checks whether the COCO JSON
+   files exist and are non-empty. If not, it automatically triggers
+   CVATXMLToCOCOConverter to (re)generate them. This makes each pipeline
+   self-contained from raw CVAT annotations, independent of which model you
+   train first.
 
 ================================================================================
 END OF DOCUMENTATION
 ================================================================================
+
+
+To run (from the repo root — see README.md for the full model list):
+
+python models/early_fusion_v2/train.py     # primary model
+python models/CNN_VIT_SELF/train.py        # from-scratch CNN + self-attention hybrid
+python models/mobilenet_v4/train.py        # MobileNetV4-Conv-Medium backbone
+python models/late_fusion_v1/train.py
+# ...one train.py per models/<name>/ folder
+
+streamlit run dashboard.py
